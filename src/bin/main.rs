@@ -1,12 +1,15 @@
 use anyhow::Result;
 use chrono::Local;
 use clap::{Parser, Subcommand};
-use mini_db::log::Level;
+use mini_db::log::{LOG_LEVEL, Level};
+use mini_db::protocol::Response;
+use mini_db::worker::{DatabaseOperation, execute_database_operation};
 use mini_db::{START_TIME, debug, error, info};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 #[derive(Parser)]
 #[command(
@@ -31,6 +34,10 @@ enum CliArgs {
         #[arg(long, default_value = "1024")]
         worker_queue_size: usize,
 
+        /// Path to the write-ahead log file
+        #[arg(long, default_value = "wal.log")]
+        wal_path: PathBuf,
+
         /// Level of verbosity for logging
         #[arg(long, default_value = "info")]
         log_level: Level,
@@ -45,27 +52,39 @@ async fn main() -> Result<()> {
         CliArgs::Start {
             server_addr,
             worker_queue_size,
+            wal_path,
             log_level,
         } => {
-            run_server(server_addr, worker_queue_size, log_level).await?;
+            run_server(server_addr, worker_queue_size, wal_path, log_level).await?;
         }
     }
 
     Ok(())
 }
 
-async fn run_server(addr: String, worker_queue_size: usize, log_level: Level) -> Result<()> {
-    let listener = TcpListener::bind(&addr).await?;
-    let addr = listener.local_addr()?;
-
+async fn run_server(
+    addr: String,
+    worker_queue_size: usize,
+    wal_path: PathBuf,
+    log_level: Level,
+) -> Result<()> {
     START_TIME
         .set(Local::now())
         .expect("Failed to set START_TIME");
+    LOG_LEVEL.set(log_level).expect("Failed to set LOG_LEVEL");
+
+    let (client_handler, db_handler) = mpsc::channel::<DatabaseOperation>(worker_queue_size);
+    tokio::spawn(async move {
+        if let Err(e) = execute_database_operation(db_handler).await {
+            error!("Database worker encountered an error: {:?}", e);
+        }
+    });
 
     let shutdown_notifier = Arc::new(Notify::new());
     let active_connections = Arc::new(AtomicU32::new(0));
 
-    let (db_handler, client_handler) = mpsc::channel(worker_queue_size);
+    let listener = TcpListener::bind(&addr).await?;
+    let addr = listener.local_addr()?;
 
     loop {
         // Wait for either a new connection or a shutdown signal
@@ -79,10 +98,11 @@ async fn run_server(addr: String, worker_queue_size: usize, log_level: Level) ->
                 match res {
                     Ok((socket, addr)) => {
                         debug!("Accepted connections from {}", addr);
-                        let db_handler = db_handler.clone();
+                        active_connections.fetch_add(1, Ordering::AcqRel);
+                        let client_handler = client_handler.clone();
                         let active_connections = active_connections.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(socket, db_handler).await {
+                            if let Err(e) = handle_client(socket, client_handler).await {
                                 error!("Error handling client (ip: {}): {:?}", addr, e);
                             };
                             active_connections.fetch_sub(1, Ordering::AcqRel);
@@ -113,8 +133,10 @@ async fn run_server(addr: String, worker_queue_size: usize, log_level: Level) ->
 
 pub async fn handle_client(
     socket: TcpStream,
-    db_handler: mpsc::Sender<mini_db::worker::ClientRequest>,
+    client_handler: mpsc::Sender<DatabaseOperation>,
 ) -> Result<()> {
+    let (worker_response, client_response) = oneshot::channel::<Response>();
+    unimplemented!();
 }
 
 /// Cross-platform Ctrl+C handler that also handles SIGTERM on Unix systems.

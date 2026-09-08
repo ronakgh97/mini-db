@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
@@ -24,4 +26,15 @@ impl Operation {
             Operation::Delete => 2,
         }
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Response {
+    Ok(Bytes),
+    KeyValue(Bytes),
+    KeyNotFound(Bytes),
+    InvalidRequest(Bytes),
+    PayloadTooLarge(Bytes),
+    InternalError(Bytes),
 }

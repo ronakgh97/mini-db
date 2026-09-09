@@ -47,10 +47,10 @@ async fn set_entries_survive_recovery() -> anyhow::Result<()> {
 
     let (mut wal, _) = Wal::init(path.clone()).await?;
     let off0 = wal
-        .append(OP_SET, Bytes::from("k1"), Bytes::from("v1"))
+        .append(OP_SET, &Bytes::from("k1"), &Bytes::from("v1"))
         .await?;
     let off1 = wal
-        .append(OP_SET, Bytes::from("k2"), Bytes::from("v2"))
+        .append(OP_SET, &Bytes::from("k2"), &Bytes::from("v2"))
         .await?;
     assert_eq!(off0, 0);
     assert_eq!(off1, record_len(2, 2));
@@ -75,11 +75,11 @@ async fn delete_removes_key_on_recovery() -> anyhow::Result<()> {
     cleanup(&path).await;
 
     let (mut wal, _) = Wal::init(path.clone()).await?;
-    wal.append(OP_SET, Bytes::from("k1"), Bytes::from("v1"))
+    wal.append(OP_SET, &Bytes::from("k1"), &Bytes::from("v1"))
         .await?;
-    wal.append(OP_SET, Bytes::from("k2"), Bytes::from("v2"))
+    wal.append(OP_SET, &Bytes::from("k2"), &Bytes::from("v2"))
         .await?;
-    wal.append(OP_DELETE, Bytes::from("k1"), Bytes::new())
+    wal.append(OP_DELETE, &Bytes::from("k1"), &Bytes::from_static(b""))
         .await?;
     wal.fsync().await?;
     drop(wal);
@@ -104,24 +104,24 @@ async fn append_rejects_structurally_invalid() -> anyhow::Result<()> {
 
     // GET(0) and unknown ops must never be logged.
     assert!(
-        wal.append(0, Bytes::from("k"), Bytes::from("v"))
+        wal.append(0, &Bytes::from("k"), &Bytes::from("v"))
             .await
             .is_err()
     );
     assert!(
-        wal.append(99, Bytes::from("k"), Bytes::from("v"))
+        wal.append(99, &Bytes::from("k"), &Bytes::from("v"))
             .await
             .is_err()
     );
     // Empty key would be unrecoverable (replay breaks on klen==0).
     assert!(
-        wal.append(OP_SET, Bytes::new(), Bytes::from("v"))
+        wal.append(OP_SET, &Bytes::from_static(b""), &Bytes::from("v"))
             .await
             .is_err()
     );
     // DELETE must carry empty value.
     assert!(
-        wal.append(OP_DELETE, Bytes::from("k"), Bytes::from("nonempty"))
+        wal.append(OP_DELETE, &Bytes::from("k"), &Bytes::from("nonempty"))
             .await
             .is_err()
     );
@@ -140,9 +140,9 @@ async fn torn_tail_is_truncated_on_init() -> anyhow::Result<()> {
     cleanup(&path).await;
 
     let (mut wal, _) = Wal::init(path.clone()).await?;
-    wal.append(OP_SET, Bytes::from("k1"), Bytes::from("v1"))
+    wal.append(OP_SET, &Bytes::from("k1"), &Bytes::from("v1"))
         .await?;
-    wal.append(OP_SET, Bytes::from("k2"), Bytes::from("v2"))
+    wal.append(OP_SET, &Bytes::from("k2"), &Bytes::from("v2"))
         .await?;
     wal.fsync().await?;
     let good_len = tokio::fs::metadata(&path).await?.len();
@@ -178,9 +178,9 @@ async fn crc_mismatch_discards_tail_suffix() -> anyhow::Result<()> {
     cleanup(&path).await;
 
     let (mut wal, _) = Wal::init(path.clone()).await?;
-    wal.append(OP_SET, Bytes::from("k1"), Bytes::from("v1"))
+    wal.append(OP_SET, &Bytes::from("k1"), &Bytes::from("v1"))
         .await?;
-    wal.append(OP_SET, Bytes::from("k2"), Bytes::from("v2"))
+    wal.append(OP_SET, &Bytes::from("k2"), &Bytes::from("v2"))
         .await?;
     wal.fsync().await?;
     drop(wal);
@@ -209,7 +209,7 @@ async fn unknown_op_tail_is_truncated_not_panicking() -> anyhow::Result<()> {
     cleanup(&path).await;
 
     let (mut wal, _) = Wal::init(path.clone()).await?;
-    wal.append(OP_SET, Bytes::from("k1"), Bytes::from("v1"))
+    wal.append(OP_SET, &Bytes::from("k1"), &Bytes::from("v1"))
         .await?;
     wal.fsync().await?;
     let good_len = tokio::fs::metadata(&path).await?.len();
@@ -246,13 +246,13 @@ async fn offsets_are_monotonic_record_starts() -> anyhow::Result<()> {
 
     let (mut wal, _) = Wal::init(path.clone()).await?;
     let o0 = wal
-        .append(OP_SET, Bytes::from("a"), Bytes::from("1111"))
+        .append(OP_SET, &Bytes::from("a"), &Bytes::from("1111"))
         .await?;
     let o1 = wal
-        .append(OP_SET, Bytes::from("bb"), Bytes::from("22"))
+        .append(OP_SET, &Bytes::from("bb"), &Bytes::from("22"))
         .await?;
     let o2 = wal
-        .append(OP_DELETE, Bytes::from("a"), Bytes::new())
+        .append(OP_DELETE, &Bytes::from("a"), &Bytes::from_static(b""))
         .await?;
 
     assert_eq!(o0, 0);

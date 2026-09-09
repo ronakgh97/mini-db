@@ -186,7 +186,7 @@ impl Wal {
 
     /// Write new entry to WAL file, returns the offset `(file_len)` of the new entry.
     /// `fsync` is not performed here, call `fsync()` to ensure durability `(DB worker owns it)`.
-    pub async fn append(&mut self, op: u8, key: Bytes, value: Bytes) -> Result<u64> {
+    pub async fn append(&mut self, op: u8, key: &[u8], value: &[u8]) -> Result<u64> {
         if op != OP_SET && op != OP_DELETE {
             anyhow::bail!("wal: only SET(1)/DELETE(2) may be logged, got {op}");
         }
@@ -201,21 +201,21 @@ impl Wal {
         let vlen = value.len();
         let total_len = HEADER_LEN + klen + vlen + CRC_LEN;
         if self.write_buf.capacity() < total_len {
-            self.write_buf
-                .reserve(total_len - self.write_buf.capacity());
+            self.write_buf.reserve(total_len);
         }
 
         // batch header and payload
+        self.write_buf.clear(); // clear at the start, for next entry
         self.write_buf.extend_from_slice(&[op]);
         self.write_buf
             .extend_from_slice(&(klen as u32).to_le_bytes());
         self.write_buf
             .extend_from_slice(&(vlen as u32).to_le_bytes());
-        self.write_buf.extend_from_slice(&key);
-        self.write_buf.extend_from_slice(&value);
+        self.write_buf.extend_from_slice(key);
+        self.write_buf.extend_from_slice(value);
 
         // compute crc32 of current entry (op, klen, vlen, key, value)
-        let crc = crc_hash(&mut self.crc32_hasher, op, klen, vlen, &key, &value);
+        let crc = crc_hash(&mut self.crc32_hasher, op, klen, vlen, key, value);
         self.write_buf.extend_from_slice(&crc.to_le_bytes());
 
         // write to WAL and flush (fsync is caller's responsibility)
@@ -224,7 +224,6 @@ impl Wal {
             .await
             .context("wal: write")?;
         self.file.flush().await.context("wal: flush")?;
-        self.write_buf.clear(); // clear for next entry
 
         // update state
         let offset = self.file_len;

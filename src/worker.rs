@@ -53,7 +53,6 @@ impl DatabaseWorker {
     /// This will keep waiting and executing operations until the main sender drops.
     pub async fn execute_operations(&mut self) -> Result<()> {
         let mut writes_executed: usize = 0;
-        // interval==0 would panic/diverge on modulo — treat as fsync-every-write.
         let interval = self.fsync_interval.max(1);
         while let Some(op) = self.db_handler.recv().await {
             match op {
@@ -62,12 +61,14 @@ impl DatabaseWorker {
                         // let _ = because the receiver might have been dropped,
                         let _ = tx.send(Ok(Response::KeyValue(value.clone())));
                     } else {
-                        let _ = tx.send(Ok(Response::KeyNotFound(Bytes::from("Key not found"))));
+                        let _ = tx.send(Ok(Response::KeyNotFound(Bytes::from_static(
+                            b"Key not found",
+                        ))));
                     }
                 }
 
                 DatabaseOperation::SET { key, value, tx } => {
-                    if let Err(e) = self.wal.append(OP_SET, key.clone(), value.clone()).await {
+                    if let Err(e) = self.wal.append(OP_SET, &key, &value).await {
                         let _ = tx.send(Err(e));
                         continue;
                     }
@@ -79,11 +80,15 @@ impl DatabaseWorker {
                         continue;
                     }
                     self.memory_index.insert(key, value);
-                    let _ = tx.send(Ok(Response::Ok(Bytes::from("OK"))));
+                    let _ = tx.send(Ok(Response::Ok(Bytes::from_static(b"OK"))));
                 }
 
                 DatabaseOperation::DELETE { key, tx } => {
-                    if let Err(e) = self.wal.append(OP_DELETE, key.clone(), Bytes::new()).await {
+                    if let Err(e) = self
+                        .wal
+                        .append(OP_DELETE, &key, &Bytes::from_static(b""))
+                        .await
+                    {
                         let _ = tx.send(Err(e));
                         continue;
                     }
@@ -95,9 +100,11 @@ impl DatabaseWorker {
                         continue;
                     }
                     if self.memory_index.remove(&key).is_some() {
-                        let _ = tx.send(Ok(Response::Ok(Bytes::from("OK"))));
+                        let _ = tx.send(Ok(Response::Ok(Bytes::from_static(b"OK"))));
                     } else {
-                        let _ = tx.send(Ok(Response::KeyNotFound(Bytes::from("Key not found"))));
+                        let _ = tx.send(Ok(Response::KeyNotFound(Bytes::from_static(
+                            b"Key not found",
+                        ))));
                     }
                 }
             }

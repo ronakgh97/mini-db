@@ -30,6 +30,7 @@ GET/SET/DELETE/PING/CLOSE = 0x00/0x01/0x02/0x03/0x04 -
 #[repr(C)]
 pub enum Response {
     Ok(Bytes),
+    Pong(Bytes),
     KeyValue(Bytes),
     KeyNotFound(Bytes),
     InvalidRequest(Bytes),
@@ -38,7 +39,7 @@ pub enum Response {
 }
 ```
 
-OK/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError = 0x00/0x01/0x02/0x03/0x04/0x05 -
+OK/Pong/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError = 0x00/0x01/0x02/0x03/0x04/0x05/0x06 -
 `(1B status|4B value_length|value|)` (All are Little Endian)
 
 **TODO**
@@ -46,4 +47,4 @@ OK/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError = 0x00/0x01
 - Multiple DB workers (Sharding and Synchronization)
 - Faster to memory index for read operations (Rwlock)
 - Multiple segmented WALs
-- Fsync infrequently and Group commits
+- Fsync infrequently and group commits

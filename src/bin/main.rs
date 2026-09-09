@@ -147,7 +147,11 @@ async fn run_server(
                         let client_handler = client_handler.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(&mut socket, max_key_size, max_value_size, client_handler).await {
-                                error!("Error handling client (ip: {}): {:?}", addr, e);
+                                if is_connection_error(&e) {
+                                    debug!("Client (ip: {}) disconnected", addr);
+                                } else {
+                                    error!("Error handling client (ip: {}): {:?}", addr, e);
+                                }
                             };
                             active_connections.fetch_sub(1, Ordering::AcqRel);
                         });
@@ -175,6 +179,17 @@ async fn run_server(
     Ok(())
 }
 
+#[inline(always)]
+fn is_connection_error(e: &anyhow::Error) -> bool {
+    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io_err.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+        );
+    }
+    false
+}
+
 pub async fn handle_client(
     socket: &mut TcpStream,
     max_key_size: usize,
@@ -193,10 +208,7 @@ pub async fn handle_client(
                 break;
             }
             Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Failed to read operation code from client: {:?}",
-                    e
-                ));
+                return Err(e.into());
             }
         };
 
@@ -273,8 +285,8 @@ pub async fn handle_client(
                 }
 
                 Operation::Ping => {
-                    // send back 'Pong' response with the same payload
-                    let rsp = Response::Pong(Bytes::from("Pong"));
+                    // send back 'PONG' response with the same payload
+                    let rsp = Response::Pong(Bytes::from_static(b"PONG"));
                     rsp.send_response(socket).await?;
                 }
 
@@ -284,7 +296,7 @@ pub async fn handle_client(
                 }
             },
             None => {
-                let rsp = Response::InvalidRequest(Bytes::from("Invalid operation code"));
+                let rsp = Response::InvalidRequest(Bytes::from_static(b"Invalid operation code"));
                 rsp.send_response(socket).await?;
                 return Err(anyhow::anyhow!("Invalid operation code"));
             }
@@ -297,7 +309,7 @@ pub async fn handle_client(
 #[inline(always)]
 async fn validate_key(key_size: usize, max_key_size: usize, socket: &mut TcpStream) -> Result<()> {
     if key_size == 0 {
-        let rsp = Response::InvalidRequest(Bytes::from("Key size cannot be zero"));
+        let rsp = Response::InvalidRequest(Bytes::from_static(b"Key size cannot be zero"));
         rsp.send_response(socket).await?;
         return Err(anyhow::anyhow!("Key cannot be empty"));
     }
@@ -323,7 +335,7 @@ async fn validate_value(
     socket: &mut TcpStream,
 ) -> Result<()> {
     if value_size == 0 {
-        let rsp = Response::InvalidRequest(Bytes::from("Value cannot be empty"));
+        let rsp = Response::InvalidRequest(Bytes::from_static(b"Value cannot be empty"));
         rsp.send_response(socket).await?;
         return Err(anyhow::anyhow!("Value cannot be empty"));
     }
@@ -357,8 +369,9 @@ async fn send_db_result_to_client(
             Err(anyhow::anyhow!("Internal error: {}", e))
         }
         Err(_) => {
-            let rsp =
-                Response::InternalError(Bytes::from("Failed to receive response from worker"));
+            let rsp = Response::InternalError(Bytes::from_static(
+                b"Failed to receive response from worker",
+            ));
             rsp.send_response(client_socket).await?;
             Err(anyhow::anyhow!("Failed to receive response from worker"))
         }

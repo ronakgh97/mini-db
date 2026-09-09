@@ -1,6 +1,6 @@
 use anyhow::Result;
-use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[repr(C)]
@@ -90,5 +90,28 @@ impl Response {
             }
         }
         Ok(())
+    }
+
+    /// Read a length-prefixed response from the given TCP stream.
+    pub async fn read_response(socket: &mut TcpStream) -> Result<Self> {
+        let status = socket.read_u8().await?;
+        let len = socket.read_u32_le().await? as usize;
+        let mut payload = BytesMut::zeroed(len);
+        socket.read_exact(&mut payload).await?;
+
+        let payload = payload.freeze(); // convert to immutable Bytes
+        match status {
+            0 => Ok(Response::Ok(payload)),
+            1 => Ok(Response::Pong(payload)),
+            2 => Ok(Response::KeyValue(payload)),
+            3 => Ok(Response::KeyNotFound(payload)),
+            4 => Ok(Response::InvalidRequest(payload)),
+            5 => Ok(Response::PayloadTooLarge(payload)),
+            6 => Ok(Response::InternalError(payload)),
+            _ => Ok(Response::InternalError(Bytes::from(format!(
+                "Unknown response code: {}",
+                status
+            )))),
+        }
     }
 }

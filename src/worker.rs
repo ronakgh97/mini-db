@@ -1,3 +1,4 @@
+use crate::protocol::Response;
 use crate::wal::Wal;
 use anyhow::Result;
 use bytes::Bytes;
@@ -11,16 +12,16 @@ use tokio::sync::oneshot::Sender;
 pub enum DatabaseOperation {
     GET {
         key: Bytes,
-        tx: Sender<Result<Bytes>>,
+        tx: Sender<Result<Response>>,
     },
     SET {
         key: Bytes,
         value: Bytes,
-        tx: Sender<Result<Bytes>>,
+        tx: Sender<Result<Response>>,
     },
     DELETE {
         key: Bytes,
-        tx: Sender<Result<Bytes>>,
+        tx: Sender<Result<Response>>,
     },
 }
 
@@ -51,7 +52,12 @@ impl DatabaseWorker {
         while let Some(op) = self.db_handler.recv().await {
             match op {
                 DatabaseOperation::GET { key, tx } => {
-                    todo!()
+                    if let Some(value) = self.memory_index.get(&key) {
+                        // let _ = because the receiver might have been dropped,
+                        let _ = tx.send(Ok(Response::KeyValue(value.clone())));
+                    } else {
+                        let _ = tx.send(Ok(Response::KeyNotFound(Bytes::from("Key not found"))));
+                    }
                 }
                 DatabaseOperation::SET { key, value, tx } => {
                     todo!()

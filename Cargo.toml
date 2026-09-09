@@ -1,11 +1,22 @@
 [package]
 name = "mini-db"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [[bin]]
 name = "mini-db"
 path = "src/bin/main.rs"
+
+[[bin]]
+name = "mini-client"
+path = "src/bin/client.rs"
+
+[[bench]]
+name = "bench"
+path = "bench/bench.rs"
+harness = false
+test = false
+doctest = false
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
@@ -16,3 +27,4 @@ anyhow = "1.0.104"
 chrono = "0.4.45"
 colored = "3.1.1"
 crc32fast = "1.5.1"
+rand = "0.10.2"

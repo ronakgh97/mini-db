@@ -54,9 +54,9 @@ impl Wal {
                     file_len: 0,
                     entry_count: 0,
                     crc32_hasher: Hasher::default(),
-                    write_buf: BytesMut::with_capacity(24 << 20),
+                    write_buf: BytesMut::with_capacity(4 * 1024),
                 },
-                HashMap::with_capacity(1 << 20),
+                HashMap::with_capacity(16),
             ));
         }
 
@@ -76,11 +76,15 @@ impl Wal {
                     let mut count = 0u64;
 
                     // least ~15 bytes min per entry (1 op + 4 klen + 4 vlen + 1 key + 1 val + 4 crc)
-                    let mut map_index: HashMap<Bytes, Bytes> = HashMap::with_capacity(len / 15);
+                    let mut map_index: HashMap<Bytes, Bytes> =
+                        HashMap::with_capacity((len / 15).max(16));
 
                     while offset + (HEADER_LEN + CRC_LEN) <= len {
                         // parse headers
                         let op = data[offset];
+                        // if op != OP_SET && op != OP_DELETE {
+                        //     break; // invalid op, stop here
+                        // }
 
                         // parse read lengths
                         let klen = u32::from_le_bytes([
@@ -95,8 +99,15 @@ impl Wal {
                             data[offset + 7],
                             data[offset + 8],
                         ]) as usize;
-                        let total_len = HEADER_LEN + klen + vlen + CRC_LEN;
 
+                        // if klen == 0 {
+                        //     break;
+                        // }
+                        // if op == OP_DELETE && vlen != 0 {
+                        //     break;
+                        // }
+
+                        let total_len = HEADER_LEN + klen + vlen + CRC_LEN;
                         // trailing incomplete unexpected entry
                         if offset + total_len > len {
                             break;
@@ -107,23 +118,30 @@ impl Wal {
                         let value_start = key_start + klen;
                         let crc_start = value_start + vlen;
 
-                        let key = Bytes::copy_from_slice(&data[key_start..value_start]);
-                        let value = Bytes::copy_from_slice(&data[value_start..crc_start]);
-
-                        // validate crc32 of entry
+                        // validate crc32 of the entry
                         let stored_crc = u32::from_le_bytes([
                             data[crc_start],
                             data[crc_start + 1],
                             data[crc_start + 2],
                             data[crc_start + 3],
                         ]);
-                        let computed_crc =
-                            crc_hash(&mut crc32_hasher, op, klen, vlen, &key, &value);
+                        let computed_crc = crc_hash(
+                            &mut crc32_hasher,
+                            op,
+                            klen,
+                            vlen,
+                            &data[key_start..value_start],
+                            &data[value_start..crc_start],
+                        );
 
                         // file corruption, stop here and discard everything after
                         if stored_crc != computed_crc {
                             break;
                         }
+
+                        // alloc/copy key/value after crc validation
+                        let key = Bytes::copy_from_slice(&data[key_start..value_start]);
+                        let value = Bytes::copy_from_slice(&data[value_start..crc_start]);
 
                         // build in-memory index
                         match op {
@@ -133,7 +151,9 @@ impl Wal {
                             OP_DELETE => {
                                 map_index.remove(&key as &[u8]);
                             }
-                            _ => { /* ignore op */ }
+                            _ => {
+                                unreachable!("op can only be SET(1) or DELETE(2), got {op}");
+                            }
                         }
                         offset += total_len;
                         count += 1;
@@ -146,6 +166,7 @@ impl Wal {
         // truncate torn/corrupt tail to last valid entry, and seek to end of valid entries for next append.
         if valid_file_len < file_len {
             file.set_len(valid_file_len).await?;
+            file.sync_all().await.context("wal: fsync truncate")?;
             file.seek(SeekFrom::Start(valid_file_len)).await?;
         }
 
@@ -156,20 +177,31 @@ impl Wal {
                 file_len: valid_file_len,
                 entry_count: valid_entry_count,
                 crc32_hasher,
-                write_buf: BytesMut::with_capacity(24 << 20),
+                write_buf: BytesMut::with_capacity(4 * 1024),
             },
             map_index,
         ))
     }
 
-    /// Write new entry to WAL file, returns the offset of the new entry.
-    /// `fsync` is not performed here, call `sync()` to ensure durability.
+    /// Write new entry to WAL file, returns the offset `(file_len)` of the new entry.
+    /// `fsync` is not performed here, call `sync()` to ensure durability `(DB worker owns it)`.
     pub async fn append(&mut self, op: u8, key: Bytes, value: Bytes) -> Result<u64> {
+        if op != OP_SET && op != OP_DELETE {
+            anyhow::bail!("wal: only SET(1)/DELETE(2) may be logged, got {op}");
+        }
+        if key.is_empty() {
+            anyhow::bail!("wal: empty key");
+        }
+        if op == OP_DELETE && !value.is_empty() {
+            anyhow::bail!("wal: DELETE must carry empty value");
+        }
+
         let klen = key.len();
         let vlen = value.len();
         let total_len = HEADER_LEN + klen + vlen + CRC_LEN;
         if self.write_buf.capacity() < total_len {
-            self.write_buf.reserve(total_len);
+            self.write_buf
+                .reserve(total_len - self.write_buf.capacity());
         }
 
         // batch header and payload

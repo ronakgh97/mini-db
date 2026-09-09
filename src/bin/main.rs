@@ -30,7 +30,7 @@ struct Cli {
 enum CliArgs {
     Start {
         /// Address of the server to bind to (format: ip:port)
-        #[arg(long, default_value = "0.0.0.0:8787")]
+        #[arg(long, default_value = "127.0.0.1:8787")]
         server_addr: String,
 
         /// Number of database operation that single worker can handle concurrently
@@ -44,6 +44,10 @@ enum CliArgs {
         /// Maximum size of a value in bytes
         #[arg(long, default_value = "16384")]
         max_value_size: usize,
+
+        /// Interval for syncing the write-ahead log to disk (in number of write-operations)
+        #[arg(long, default_value = "6")]
+        fsync_interval: usize,
 
         /// Path to the write-ahead log file
         #[arg(long, default_value = "wal.log")]
@@ -65,6 +69,7 @@ async fn main() -> Result<()> {
             max_key_size,
             max_value_size,
             max_queue_size,
+            fsync_interval,
             wal_path,
             log_level,
         } => {
@@ -73,6 +78,7 @@ async fn main() -> Result<()> {
                 max_key_size,
                 max_value_size,
                 max_queue_size,
+                fsync_interval,
                 wal_path,
                 log_level,
             )
@@ -88,6 +94,7 @@ async fn run_server(
     max_key_size: usize,
     max_value_size: usize,
     max_queue_size: usize,
+    fsync_interval: usize,
     wal_path: PathBuf,
     log_level: Level,
 ) -> Result<()> {
@@ -102,7 +109,7 @@ async fn run_server(
 
     // init database worker(s) and mpsc channel for communication
     let (client_handler, db_handler) = mpsc::channel::<DatabaseOperation>(max_queue_size);
-    let mut db_worker = DatabaseWorker::init(wal, map_index, db_handler);
+    let mut db_worker = DatabaseWorker::init(wal, fsync_interval, map_index, db_handler);
 
     tokio::spawn(async move {
         if let Err(e) = db_worker.execute_operations().await {
@@ -185,7 +192,7 @@ pub async fn handle_client(
                 let key_size = socket.read_u32_le().await? as usize;
 
                 // validate key size before reading the key from the socket
-                validate_key(key_size, max_key_size, socket).await?;
+                validate_key(key_size, max_key_size, &mut socket).await?;
 
                 let mut key_buf = BytesMut::with_capacity(key_size);
                 socket.read_exact(&mut key_buf).await?;
@@ -207,8 +214,8 @@ pub async fn handle_client(
                 let value_size = socket.read_u32_le().await? as usize;
 
                 // validation for key and value
-                validate_key(key_size, max_key_size, socket).await?;
-                validate_value(value_size, max_value_size, socket).await?;
+                validate_key(key_size, max_key_size, &mut socket).await?;
+                validate_value(value_size, max_value_size, &mut socket).await?;
 
                 let mut key_buf = BytesMut::with_capacity(key_size);
                 socket.read_exact(&mut key_buf).await?;
@@ -232,7 +239,7 @@ pub async fn handle_client(
                 let key_size = socket.read_u32_le().await? as usize;
 
                 // validate key only, cuz its DELETE
-                validate_key(key_size, max_key_size, socket).await?;
+                validate_key(key_size, max_key_size, &mut socket).await?;
 
                 let mut key_buf = BytesMut::with_capacity(key_size);
                 socket.read_exact(&mut key_buf).await?;
@@ -260,10 +267,10 @@ pub async fn handle_client(
 }
 
 #[inline(always)]
-async fn validate_key(key_size: usize, max_key_size: usize, mut socket: TcpStream) -> Result<()> {
+async fn validate_key(key_size: usize, max_key_size: usize, socket: &mut TcpStream) -> Result<()> {
     if key_size == 0 {
         let rsp = Response::InvalidRequest(Bytes::from("Key size cannot be zero"));
-        rsp.send_response(&mut socket).await?;
+        rsp.send_response(socket).await?;
         return Err(anyhow::anyhow!("Key cannot be empty"));
     }
     if key_size > max_key_size {
@@ -271,11 +278,10 @@ async fn validate_key(key_size: usize, max_key_size: usize, mut socket: TcpStrea
             "Key size {} exceeds maximum allowed size of {} bytes",
             key_size, max_key_size
         )));
-        rsp.send_response(&mut socket).await?;
-        return Err(anyhow::anyhow!((
+        rsp.send_response(socket).await?;
+        return Err(anyhow::anyhow!(format!(
             "Key size {} exceeds maximum allowed size of {} bytes",
-            key_size,
-            max_key_size
+            key_size, max_key_size
         )));
     }
 
@@ -286,11 +292,11 @@ async fn validate_key(key_size: usize, max_key_size: usize, mut socket: TcpStrea
 async fn validate_value(
     value_size: usize,
     max_value_size: usize,
-    mut socket: TcpStream,
+    socket: &mut TcpStream,
 ) -> Result<()> {
     if value_size == 0 {
         let rsp = Response::InvalidRequest(Bytes::from("Value cannot be empty"));
-        rsp.send_response(&mut socket).await?;
+        rsp.send_response(socket).await?;
         return Err(anyhow::anyhow!("Value cannot be empty"));
     }
     if value_size > max_value_size {
@@ -298,11 +304,10 @@ async fn validate_value(
             "Value size {} exceeds maximum allowed size of {} bytes",
             value_size, max_value_size
         )));
-        rsp.send_response(&mut socket).await?;
-        return Err(anyhow::anyhow!((
+        rsp.send_response(socket).await?;
+        return Err(anyhow::anyhow!(format!(
             "Value size {} exceeds maximum allowed size of {} bytes",
-            value_size,
-            max_value_size
+            value_size, max_value_size
         )));
     }
     Ok(())

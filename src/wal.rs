@@ -11,8 +11,8 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 pub const HEADER_LEN: usize = 1 + 4 + 4; // op + klen + vlen
 pub const CRC_LEN: usize = 4; // CRC32 of (op, klen, vlen, key, value)
 
-const OP_SET: u8 = 1;
-const OP_DELETE: u8 = 2;
+pub const OP_SET: u8 = 1;
+pub const OP_DELETE: u8 = 2;
 
 /// Single-file WAL owned by a single DB worker.
 /// Entry format: `(1 B OP | 4B KLEN | 4B VLEN | key | value | 4B CRC32)`.
@@ -33,10 +33,10 @@ pub struct Wal {
 impl Wal {
     /// Open or create WAL file, recover from torn/corrupt tail, and return WAL handle and rebuilt memory index.
     pub async fn init(file_path: PathBuf) -> Result<(Self, HashMap<Bytes, Bytes>)> {
-        if let Some(parent) = file_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        if let Some(parent) = file_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
         }
         let mut file = OpenOptions::default()
             .read(true)
@@ -184,7 +184,7 @@ impl Wal {
     }
 
     /// Write new entry to WAL file, returns the offset `(file_len)` of the new entry.
-    /// `fsync` is not performed here, call `sync()` to ensure durability `(DB worker owns it)`.
+    /// `fsync` is not performed here, call `fsync()` to ensure durability `(DB worker owns it)`.
     pub async fn append(&mut self, op: u8, key: Bytes, value: Bytes) -> Result<u64> {
         if op != OP_SET && op != OP_DELETE {
             anyhow::bail!("wal: only SET(1)/DELETE(2) may be logged, got {op}");
@@ -234,7 +234,7 @@ impl Wal {
     }
 
     /// Flush and sync WAL file to disk.
-    pub async fn sync(&mut self) -> Result<()> {
+    pub async fn fsync(&mut self) -> Result<()> {
         self.file.flush().await.context("wal: flush")?;
         self.file.sync_all().await.context("wal: fsync")?;
         Ok(())

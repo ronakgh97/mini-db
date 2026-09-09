@@ -54,7 +54,7 @@ async fn set_entries_survive_recovery() -> anyhow::Result<()> {
         .await?;
     assert_eq!(off0, 0);
     assert_eq!(off1, record_len(2, 2));
-    wal.sync().await?;
+    wal.fsync().await?;
     assert_eq!(wal.entry_count(), 2);
     drop(wal);
 
@@ -81,7 +81,7 @@ async fn delete_removes_key_on_recovery() -> anyhow::Result<()> {
         .await?;
     wal.append(OP_DELETE, Bytes::from("k1"), Bytes::new())
         .await?;
-    wal.sync().await?;
+    wal.fsync().await?;
     drop(wal);
 
     let (wal2, map) = Wal::init(path.clone()).await?;
@@ -144,7 +144,7 @@ async fn torn_tail_is_truncated_on_init() -> anyhow::Result<()> {
         .await?;
     wal.append(OP_SET, Bytes::from("k2"), Bytes::from("v2"))
         .await?;
-    wal.sync().await?;
+    wal.fsync().await?;
     let good_len = tokio::fs::metadata(&path).await?.len();
     drop(wal);
 
@@ -182,7 +182,7 @@ async fn crc_mismatch_discards_tail_suffix() -> anyhow::Result<()> {
         .await?;
     wal.append(OP_SET, Bytes::from("k2"), Bytes::from("v2"))
         .await?;
-    wal.sync().await?;
+    wal.fsync().await?;
     drop(wal);
 
     let good_len = record_len(2, 2); // only k1 survives after we corrupt k2
@@ -211,7 +211,7 @@ async fn unknown_op_tail_is_truncated_not_panicking() -> anyhow::Result<()> {
     let (mut wal, _) = Wal::init(path.clone()).await?;
     wal.append(OP_SET, Bytes::from("k1"), Bytes::from("v1"))
         .await?;
-    wal.sync().await?;
+    wal.fsync().await?;
     let good_len = tokio::fs::metadata(&path).await?.len();
     drop(wal);
 

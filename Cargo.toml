@@ -10,9 +10,9 @@ path = "src/bin/main.rs"
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
 clap = { version = "4.6.6", features = ["derive"] }
-anyhow = "1.0.104"
+memmap2 = "0.9.11"
 bytes = "1.12.1"
+anyhow = "1.0.104"
 chrono = "0.4.45"
 colored = "3.1.1"
 crc32fast = "1.5.1"
-# memmap2 = "0.9.11"

@@ -9,6 +9,8 @@ pub enum Operation {
     Get,
     Set,
     Delete,
+    Ping,
+    Close,
 }
 
 impl Operation {
@@ -18,6 +20,8 @@ impl Operation {
             0 => Some(Operation::Get),
             1 => Some(Operation::Set),
             2 => Some(Operation::Delete),
+            3 => Some(Operation::Ping),
+            4 => Some(Operation::Close),
             _ => None,
         }
     }
@@ -27,6 +31,8 @@ impl Operation {
             Operation::Get => 0,
             Operation::Set => 1,
             Operation::Delete => 2,
+            Operation::Ping => 3,
+            Operation::Close => 4,
         }
     }
 }
@@ -35,6 +41,7 @@ impl Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     Ok(Bytes),
+    Pong(Bytes),
     KeyValue(Bytes),
     KeyNotFound(Bytes),
     InvalidRequest(Bytes),
@@ -43,7 +50,7 @@ pub enum Response {
 }
 
 impl Response {
-    /// Send the response over the given TCP stream.
+    /// Send the length-prefixed response over the given TCP stream.
     pub async fn send_response(&self, socket: &mut TcpStream) -> Result<()> {
         match self {
             Response::Ok(payload) => {
@@ -51,28 +58,33 @@ impl Response {
                 socket.write_u32_le(payload.len() as u32).await?;
                 socket.write_all(payload).await?;
             }
-            Response::KeyValue(payload) => {
+            Response::Pong(payload) => {
                 socket.write_u8(1).await?;
                 socket.write_u32_le(payload.len() as u32).await?;
                 socket.write_all(payload).await?;
             }
-            Response::KeyNotFound(payload) => {
+            Response::KeyValue(payload) => {
                 socket.write_u8(2).await?;
                 socket.write_u32_le(payload.len() as u32).await?;
                 socket.write_all(payload).await?;
             }
-            Response::InvalidRequest(payload) => {
+            Response::KeyNotFound(payload) => {
                 socket.write_u8(3).await?;
                 socket.write_u32_le(payload.len() as u32).await?;
                 socket.write_all(payload).await?;
             }
-            Response::PayloadTooLarge(payload) => {
+            Response::InvalidRequest(payload) => {
                 socket.write_u8(4).await?;
                 socket.write_u32_le(payload.len() as u32).await?;
                 socket.write_all(payload).await?;
             }
-            Response::InternalError(payload) => {
+            Response::PayloadTooLarge(payload) => {
                 socket.write_u8(5).await?;
+                socket.write_u32_le(payload.len() as u32).await?;
+                socket.write_all(payload).await?;
+            }
+            Response::InternalError(payload) => {
+                socket.write_u8(6).await?;
                 socket.write_u32_le(payload.len() as u32).await?;
                 socket.write_all(payload).await?;
             }

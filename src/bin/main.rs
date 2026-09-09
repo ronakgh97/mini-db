@@ -139,14 +139,14 @@ async fn run_server(
             }
             res = listener.accept() => {
                 match res {
-                    Ok((socket, addr)) => {
+                    Ok((mut socket, addr)) => {
                         debug!("Accepted connections from {}", addr);
                         active_connections.fetch_add(1, Ordering::AcqRel); // inc active connections count
                         let active_connections = active_connections.clone(); // clone for the spawned task, dec when returns
 
                         let client_handler = client_handler.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(socket, max_key_size, max_value_size, client_handler).await {
+                            if let Err(e) = handle_client(&mut socket, max_key_size, max_value_size, client_handler).await {
                                 error!("Error handling client (ip: {}): {:?}", addr, e);
                             };
                             active_connections.fetch_sub(1, Ordering::AcqRel);
@@ -176,90 +176,118 @@ async fn run_server(
 }
 
 pub async fn handle_client(
-    mut socket: TcpStream,
+    socket: &mut TcpStream,
     max_key_size: usize,
     max_value_size: usize,
     client_handler: mpsc::Sender<DatabaseOperation>,
 ) -> Result<()> {
-    let (worker_result, client_response) = oneshot::channel::<Result<Response>>();
-    socket.nodelay()?;
+    socket.nodelay()?; // disable Nagle's algorithm
 
-    let op = socket.read_u8().await?;
+    loop {
+        let (worker_result, client_response) = oneshot::channel::<Result<Response>>();
 
-    match Operation::from_u8(op) {
-        Some(op) => match op {
-            Operation::Get => {
-                let key_size = socket.read_u32_le().await? as usize;
-
-                // validate key size before reading the key from the socket
-                validate_key(key_size, max_key_size, &mut socket).await?;
-
-                let mut key_buf = BytesMut::with_capacity(key_size);
-                socket.read_exact(&mut key_buf).await?;
-
-                // send to DB worker via MPSC queue
-                // TODO; do sharding here later for better performance
-                client_handler
-                    .send(DatabaseOperation::GET {
-                        key: key_buf.freeze(),
-                        tx: worker_result,
-                    })
-                    .await?;
-
-                // wait for db to process result from DB worker and send response back to client
-                send_db_result_to_client(client_response, socket).await?;
+        let op = match socket.read_u8().await {
+            Ok(op) => op,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // client sends FIN, close the connection gracefully
+                break;
             }
-            Operation::Set => {
-                let key_size = socket.read_u32_le().await? as usize;
-                let value_size = socket.read_u32_le().await? as usize;
-
-                // validation for key and value
-                validate_key(key_size, max_key_size, &mut socket).await?;
-                validate_value(value_size, max_value_size, &mut socket).await?;
-
-                let mut key_buf = BytesMut::with_capacity(key_size);
-                socket.read_exact(&mut key_buf).await?;
-
-                let mut value_buf = BytesMut::with_capacity(value_size);
-                socket.read_exact(&mut value_buf).await?;
-
-                // send to DB worker
-                client_handler
-                    .send(DatabaseOperation::SET {
-                        key: key_buf.freeze(),
-                        value: value_buf.freeze(),
-                        tx: worker_result,
-                    })
-                    .await?;
-
-                // wait for response from DB worker and send back to client
-                send_db_result_to_client(client_response, socket).await?;
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to read operation code from client: {:?}",
+                    e
+                ));
             }
-            Operation::Delete => {
-                let key_size = socket.read_u32_le().await? as usize;
+        };
 
-                // validate key only, cuz its DELETE
-                validate_key(key_size, max_key_size, &mut socket).await?;
+        match Operation::from_u8(op) {
+            Some(op) => match op {
+                Operation::Get => {
+                    let key_size = socket.read_u32_le().await? as usize;
 
-                let mut key_buf = BytesMut::with_capacity(key_size);
-                socket.read_exact(&mut key_buf).await?;
+                    // validate key size before reading the key from the socket
+                    validate_key(key_size, max_key_size, socket).await?;
 
-                // send to DB worker(s)
-                client_handler
-                    .send(DatabaseOperation::DELETE {
-                        key: key_buf.freeze(),
-                        tx: worker_result,
-                    })
-                    .await?;
+                    let mut key_buf = BytesMut::zeroed(key_size);
+                    socket.read_exact(&mut key_buf).await?;
 
-                // wait for response from DB worker and send back to client
-                send_db_result_to_client(client_response, socket).await?;
+                    // send to DB worker via MPSC queue
+                    // TODO; do sharding here later for better performance
+                    client_handler
+                        .send(DatabaseOperation::GET {
+                            key: key_buf.freeze(),
+                            tx: worker_result,
+                        })
+                        .await?;
+
+                    // wait for db to process result from DB worker and send response back to client
+                    send_db_result_to_client(client_response, socket).await?;
+                }
+
+                Operation::Set => {
+                    let key_size = socket.read_u32_le().await? as usize;
+                    let value_size = socket.read_u32_le().await? as usize;
+
+                    // validation for key and value
+                    validate_key(key_size, max_key_size, socket).await?;
+                    validate_value(value_size, max_value_size, socket).await?;
+
+                    let mut key_buf = BytesMut::zeroed(key_size);
+                    socket.read_exact(&mut key_buf).await?;
+
+                    let mut value_buf = BytesMut::zeroed(value_size);
+                    socket.read_exact(&mut value_buf).await?;
+
+                    // send to DB worker
+                    client_handler
+                        .send(DatabaseOperation::SET {
+                            key: key_buf.freeze(),
+                            value: value_buf.freeze(),
+                            tx: worker_result,
+                        })
+                        .await?;
+
+                    // wait for response from DB worker and send back to client
+                    send_db_result_to_client(client_response, socket).await?;
+                }
+
+                Operation::Delete => {
+                    let key_size = socket.read_u32_le().await? as usize;
+
+                    // validate key only, cuz its DELETE
+                    validate_key(key_size, max_key_size, socket).await?;
+
+                    let mut key_buf = BytesMut::zeroed(key_size);
+                    socket.read_exact(&mut key_buf).await?;
+
+                    // send to DB worker(s)
+                    client_handler
+                        .send(DatabaseOperation::DELETE {
+                            key: key_buf.freeze(),
+                            tx: worker_result,
+                        })
+                        .await?;
+
+                    // wait for response from DB worker and send back to client
+                    send_db_result_to_client(client_response, socket).await?;
+                }
+
+                Operation::Ping => {
+                    // send back 'Pong' response with the same payload
+                    let rsp = Response::Pong(Bytes::from("Pong"));
+                    rsp.send_response(socket).await?;
+                }
+
+                Operation::Close => {
+                    // client wants to close the connection, break the loop and close gracefully
+                    break;
+                }
+            },
+            None => {
+                let rsp = Response::InvalidRequest(Bytes::from("Invalid operation code"));
+                rsp.send_response(socket).await?;
+                return Err(anyhow::anyhow!("Invalid operation code"));
             }
-        },
-        None => {
-            let rsp = Response::InvalidRequest(Bytes::from("Invalid operation code"));
-            rsp.send_response(&mut socket).await?;
-            return Err(anyhow::anyhow!("Invalid operation code"));
         }
     }
 
@@ -316,22 +344,22 @@ async fn validate_value(
 #[inline(always)]
 async fn send_db_result_to_client(
     client_response: oneshot::Receiver<Result<Response>>,
-    mut client_socket: TcpStream,
+    client_socket: &mut TcpStream,
 ) -> Result<()> {
     match client_response.await {
-        Ok(Ok(response)) => response.send_response(&mut client_socket).await,
+        Ok(Ok(response)) => response.send_response(client_socket).await,
         Ok(Err(e)) => {
             let rsp = Response::InternalError(Bytes::from(format!(
                 "Something went terribly wrong: {}",
                 e
             )));
-            rsp.send_response(&mut client_socket).await?;
+            rsp.send_response(client_socket).await?;
             Err(anyhow::anyhow!("Internal error: {}", e))
         }
         Err(_) => {
             let rsp =
                 Response::InternalError(Bytes::from("Failed to receive response from worker"));
-            rsp.send_response(&mut client_socket).await?;
+            rsp.send_response(client_socket).await?;
             Err(anyhow::anyhow!("Failed to receive response from worker"))
         }
     }

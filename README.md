@@ -16,10 +16,12 @@ pub enum Operation {
     Get,
     Set,
     Delete,
+    Ping,
+    Close,
 }
 ```
 
-GET/SET/DELETE = 0x00/0x01/0x02 -
+GET/SET/DELETE/PING/CLOSE = 0x00/0x01/0x02/0x03/0x04 -
 `(1B op|4B key_length|4B value_length|key|value|)` (All are Little Endian)
 
 - Response

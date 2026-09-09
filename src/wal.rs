@@ -163,7 +163,8 @@ impl Wal {
             })
             .await??;
 
-        // truncate torn/corrupt tail to last valid entry, and seek to end of valid entries for next append.
+        // truncate torn/corrupt tail to last valid entry,
+        // and seek to end of valid entries for next append
         if valid_file_len < file_len {
             file.set_len(valid_file_len).await?;
             file.sync_all().await.context("wal: fsync truncate")?;

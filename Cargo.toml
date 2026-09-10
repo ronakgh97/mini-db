@@ -11,12 +11,23 @@ path = "src/bin/main.rs"
 name = "mini-client"
 path = "src/bin/client.rs"
 
-[[bench]]
-name = "bench"
+[[bin]]
+name = "mini-bench"
 path = "bench/bench.rs"
-harness = false
-test = false
-doctest = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+debug = false
+
+[profile.dev]
+opt-level = 1
+debug = true
+incremental = true
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }

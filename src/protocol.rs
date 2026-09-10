@@ -1,10 +1,12 @@
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
+use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Represents the different operations that clients can perform in the mini-db protocol.
 pub enum Operation {
     Get,
     Set,
@@ -54,39 +56,60 @@ impl Response {
     pub async fn send_response(&self, socket: &mut TcpStream) -> Result<()> {
         match self {
             Response::Ok(payload) => {
-                socket.write_u8(0).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 0;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
             Response::Pong(payload) => {
-                socket.write_u8(1).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 1;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
             Response::KeyValue(payload) => {
-                socket.write_u8(2).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 2;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
             Response::KeyNotFound(payload) => {
-                socket.write_u8(3).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 3;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
             Response::InvalidRequest(payload) => {
-                socket.write_u8(4).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 4;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
             Response::PayloadTooLarge(payload) => {
-                socket.write_u8(5).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 5;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
             Response::InternalError(payload) => {
-                socket.write_u8(6).await?;
-                socket.write_u32_le(payload.len() as u32).await?;
-                socket.write_all(payload).await?;
+                let mut header = [0u8; 5];
+                header[0] = 6;
+                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
+                let _ = socket.write_vectored(&bufs).await?;
             }
         }
         Ok(())

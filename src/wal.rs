@@ -56,14 +56,15 @@ impl Wal {
                     crc32_hasher: Hasher::default(),
                     write_buf: BytesMut::with_capacity(4 * 1024),
                 },
-                HashMap::with_capacity(16),
+                HashMap::with_capacity(64),
             ));
         }
 
         let (valid_file_len, valid_entry_count, crc32_hasher, map_index) =
             tokio::task::spawn_blocking({
                 let path = file_path.clone();
-                // this performs runtime cpu feature detection, so we can't spam it in loop
+                // this performs runtime cpu feature detection,
+                // so we can't spam it in loop
                 let mut crc32_hasher = Hasher::default();
 
                 move || -> Result<(u64, u64, Hasher, HashMap<Bytes, Bytes>)> {
@@ -72,19 +73,16 @@ impl Wal {
 
                     let data = &mmap[..];
                     let len = data.len();
-                    let mut offset = 0usize;
                     let mut count = 0u64;
+                    let mut offset = 0usize;
 
                     // least ~15 bytes min per entry (1 op + 4 klen + 4 vlen + 1 key + 1 val + 4 crc)
                     let mut map_index: HashMap<Bytes, Bytes> =
-                        HashMap::with_capacity((len / 15).max(16));
+                        HashMap::with_capacity((len / 15).max(64));
 
                     while offset + (HEADER_LEN + CRC_LEN) <= len {
                         // parse headers
                         let op = data[offset];
-                        // if op != OP_SET && op != OP_DELETE {
-                        //     break; // invalid op, stop here
-                        // }
 
                         // parse read lengths
                         let klen = u32::from_le_bytes([
@@ -99,15 +97,8 @@ impl Wal {
                             data[offset + 7],
                             data[offset + 8],
                         ]) as usize;
-
-                        // if klen == 0 {
-                        //     break;
-                        // }
-                        // if op == OP_DELETE && vlen != 0 {
-                        //     break;
-                        // }
-
                         let total_len = HEADER_LEN + klen + vlen + CRC_LEN;
+
                         // trailing incomplete unexpected entry
                         if offset + total_len > len {
                             break;
@@ -161,7 +152,8 @@ impl Wal {
                     Ok((offset as u64, count, crc32_hasher, map_index))
                 }
             })
-            .await??;
+            .await?
+            .context("wal: build index")?;
 
         // truncate torn/corrupt tail to last valid entry,
         // and seek to end of valid entries for next append
@@ -186,6 +178,7 @@ impl Wal {
 
     /// Write new entry to WAL file, returns the offset `(file_len)` of the new entry.
     /// `fsync` is not performed here, call `fsync()` to ensure durability `(DB worker owns it)`.
+    #[inline(always)]
     pub async fn append(&mut self, op: u8, key: &[u8], value: &[u8]) -> Result<u64> {
         if op != OP_SET && op != OP_DELETE {
             anyhow::bail!("wal: only SET(1)/DELETE(2) may be logged, got {op}");
@@ -233,7 +226,14 @@ impl Wal {
         Ok(offset)
     }
 
+    /// Build/Recover index of the keys and values in the WAL file.
+    #[allow(unused)]
+    fn build_index(&self) -> Result<HashMap<Bytes, Bytes>> {
+        unimplemented!()
+    }
+
     /// Flush and sync WAL file to disk.
+    #[inline(always)]
     pub async fn fsync(&mut self) -> Result<()> {
         self.file.flush().await.context("wal: flush")?;
         self.file.sync_all().await.context("wal: fsync")?;

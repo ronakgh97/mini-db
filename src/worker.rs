@@ -109,7 +109,7 @@ impl DatabaseWorker {
                 }
             }
         }
-        // Final fsync so the last partial batch (< interval) is durable on shutdown.
+        // final fsync before returning
         let _ = self.wal.fsync().await;
         Ok(())
     }

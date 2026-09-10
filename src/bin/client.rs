@@ -55,47 +55,40 @@ async fn main() -> Result<()> {
         match cmd.as_str() {
             "QUIT" => {
                 send_request(&mut stream, Operation::Close, &[], &[]).await?;
-                println!("Bye!");
                 break;
             }
+
             "PING" => {
                 let start = Instant::now();
                 send_request(&mut stream, Operation::Ping, &[], &[]).await?;
                 let resp = Response::read_response(&mut stream).await?;
                 let elapsed = start.elapsed();
-                match resp {
-                    Response::Pong(_) => println!("Pong ({:.2}ms)", elapsed.as_secs_f64() * 1000.0),
-                    _ => print_response(&resp, elapsed),
-                }
+                print_response(&resp, elapsed);
             }
+
             "GET" => {
                 if parts.len() < 2 {
                     println!("Usage: GET <key>");
                     continue;
                 }
                 let key = parts[1].as_bytes();
+                let value = &[];
+
                 let start = Instant::now();
-                send_request(&mut stream, Operation::Get, key, &[]).await?;
+                send_request(&mut stream, Operation::Get, key, value).await?;
                 let resp = Response::read_response(&mut stream).await?;
                 let elapsed = start.elapsed();
-                match resp {
-                    Response::KeyValue(val) => {
-                        let val_str = String::from_utf8_lossy(&val);
-                        println!("\"{}\" ({:.2}ms)", val_str, elapsed.as_secs_f64() * 1000.0);
-                    }
-                    _ => print_response(&resp, elapsed),
-                }
+                print_response(&resp, elapsed);
             }
+
             "SET" => {
                 if parts.len() < 3 {
                     println!("Usage: SET <key> <value>");
                     continue;
                 }
                 let key = parts[1].as_bytes();
-                // value is everything after the second space (allows spaces in values)
-                let space_idx = input.find(' ').unwrap();
-                let space_idx = input[space_idx + 1..].find(' ').unwrap() + space_idx + 1;
-                let value = &input.as_bytes()[space_idx + 1..];
+                let value = parts[2].as_bytes();
+
                 let start = Instant::now();
                 send_request(&mut stream, Operation::Set, key, value).await?;
                 let resp = Response::read_response(&mut stream).await?;
@@ -108,8 +101,10 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let key = parts[1].as_bytes();
+                let value = &[];
+
                 let start = Instant::now();
-                send_request(&mut stream, Operation::Delete, key, &[]).await?;
+                send_request(&mut stream, Operation::Delete, key, value).await?;
                 let resp = Response::read_response(&mut stream).await?;
                 let elapsed = start.elapsed();
                 print_response(&resp, elapsed);

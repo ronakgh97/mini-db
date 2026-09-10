@@ -74,3 +74,4 @@ Results
 - Faster to memory index for read operations (Rwlock)
 - Multiple segmented WALs
 - Fsync infrequently and group commits
+- Multi-tenancy and proper userspaces

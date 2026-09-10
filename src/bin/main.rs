@@ -144,6 +144,7 @@ async fn run_server(
                         active_connections.fetch_add(1, Ordering::AcqRel); // inc active connections count
                         let active_connections = active_connections.clone(); // clone for the spawned task, dec when returns
 
+                        // clone for main sender, for each client connected
                         let client_handler = client_handler.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(&mut socket, max_key_size, max_value_size, client_handler).await {

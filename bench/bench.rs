@@ -1,19 +1,23 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
+use mini_db::protocol::Response;
+use mini_db::wal::HEADER_LEN;
 use rand::rngs::SmallRng;
 use rand::{Rng, RngExt, SeedableRng, rng};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
+use tokio::task::JoinSet;
 
 const OP_GET: u8 = 0;
 const OP_SET: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Workload {
-    Set,
-    Get,
+    Read,
+    Write,
     ReadOverwrite,
 }
 
@@ -67,13 +71,102 @@ async fn main() -> Result<()> {
     validate(&args)?;
     print_config(&args);
 
-    let mut kv_space = KeySpace::init(args.keyspace, args.key_size, args.value_size)?;
+    let kv_space = Arc::new(KeySpace::init(
+        args.keyspace,
+        args.key_size,
+        args.value_size,
+    )?);
 
-    // prefill the database server before starting the benchmark
-    println!("Prefilling {} keys...", args.keyspace);
-    kv_space.fill_db_server(&args.server_addr).await?;
+    // assume fresh DB, so SET does not need to prefill keys, it's not ReadOverwrite
+    if args.workload != Workload::Write {
+        print!("prefilling {} keys...", args.keyspace);
+        let start = Instant::now();
+        kv_space
+            .fill_db_server(&args.server_addr)
+            .await
+            .context("failed to prefill db")?;
+        println!(" done in {:.2?}", start.elapsed());
+    }
 
-    // TODO:
+    let mut clients = Vec::with_capacity(args.clients);
+    for _ in 0..args.clients {
+        clients.push(Client::connect(&args.server_addr, &kv_space).await?);
+    }
+
+    let workload = args.workload;
+    let read_percent = args.read_percent;
+
+    print!("warming up with {} operations...", args.warmup);
+    let start = Instant::now();
+    let mut warmup_tasks = JoinSet::new();
+    for (id, mut client) in clients.into_iter().enumerate() {
+        let space = Arc::clone(&kv_space);
+        let operations = share_workload(args.warmup, args.clients, id);
+
+        warmup_tasks.spawn(async move {
+            client
+                .run(&space, workload, read_percent, operations)
+                .await
+                .with_context(|| format!("warming up client {id}"))?;
+
+            Ok::<_, anyhow::Error>((id, client))
+        });
+    }
+
+    let mut ready_clients = Vec::with_capacity(args.clients);
+    while let Some(result) = warmup_tasks.join_next().await {
+        ready_clients.push(result.context("warmup task panicked")??);
+    }
+    println!(" done in {:.2?}", start.elapsed());
+
+    // wait for all clients to complete the warmup phase before starting the benchmark
+    let start_barrier = Arc::new(Barrier::new(args.clients + 1));
+    let mut tasks = JoinSet::new();
+
+    for (id, mut client) in ready_clients {
+        let space = Arc::clone(&kv_space);
+        let barrier = Arc::clone(&start_barrier);
+        let operations = share_workload(args.operations, args.clients, id);
+
+        tasks.spawn(async move {
+            barrier.wait().await;
+
+            client
+                .run(&space, workload, read_percent, operations)
+                .await
+                .with_context(|| format!("running client {id}"))?;
+
+            Ok::<_, anyhow::Error>((operations, Instant::now()))
+        });
+    }
+
+    println!();
+    println!("running {} sampled operations", args.operations);
+
+    // start measured run
+    let started = Instant::now();
+    start_barrier.wait().await;
+
+    let mut completed = 0;
+    let mut finished = started;
+
+    while let Some(result) = tasks.join_next().await {
+        let (operations, client_finished) = result.context("benchmark task panicked")??;
+
+        completed += operations;
+        finished = finished.max(client_finished);
+    }
+
+    let elapsed = finished.duration_since(started);
+
+    println!();
+    println!("Results");
+    println!("  completed:  {completed}");
+    println!("  elapsed:    {:.3} s", elapsed.as_secs_f64());
+    println!(
+        "  throughput: {:.0} ops/s",
+        completed as f64 / elapsed.as_secs_f64()
+    );
 
     Ok(())
 }
@@ -113,12 +206,16 @@ fn validate(args: &Args) -> Result<()> {
     Ok(())
 }
 
+#[inline(always)]
+fn share_workload(total: usize, clients: usize, id: usize) -> usize {
+    total / clients + usize::from(id < total % clients)
+}
+
 struct KeySpace {
     keys: Box<[u8]>,
     key_size: usize,
     values: Box<[u8]>,
     value_size: usize,
-    rng: SmallRng,
 }
 
 impl KeySpace {
@@ -134,49 +231,126 @@ impl KeySpace {
             key_size,
             values: values.into_boxed_slice(),
             value_size,
-            rng: SmallRng::from_rng(&mut rng()),
         })
     }
 
     #[inline(always)]
-    fn get_random_key(&mut self) -> &[u8] {
-        let idx = self.rng.random_range(0..self.keys.len() / self.key_size);
-        let start = idx * self.key_size;
-        let end = start + self.key_size;
-        &self.keys[start..end]
+    fn get_key(&self, index: usize) -> &[u8] {
+        let start = index * self.key_size;
+        &self.keys[start..start + self.key_size]
     }
 
     #[inline(always)]
-    fn get_random_value(&mut self) -> &[u8] {
-        let idx = self
-            .rng
-            .random_range(0..self.values.len() / self.value_size);
-        let start = idx * self.value_size;
-        let end = start + self.value_size;
-        &self.values[start..end]
+    fn get_value(&self, index: usize) -> &[u8] {
+        let start = index * self.value_size;
+        &self.values[start..start + self.value_size]
     }
 
-    async fn fill_db_server(&mut self, server_addr: &str) -> Result<()> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.keys.len() / self.key_size
+    }
+
+    async fn fill_db_server(&self, server_addr: &str) -> Result<()> {
         let mut socket = TcpStream::connect(server_addr).await?;
         socket.set_nodelay(true)?;
 
-        // fill db with all keys and values in the keyspace
-        for i in 0..self.keys.len() {
-            let key_start = i * self.key_size;
-            let key_end = key_start + self.key_size;
-            let key = &self.keys[key_start..key_end];
-
-            let value_start = i * self.value_size;
-            let value_end = value_start + self.value_size;
-            let value = &self.values[value_start..value_end];
+        for i in 0..self.len() {
+            let key = self.get_key(i);
+            let value = self.get_value(i);
 
             socket.write_u8(OP_SET).await?;
-            socket.write_u32_le(self.key_size as u32).await?;
+            socket.write_u32_le(key.len() as u32).await?;
+            socket.write_u32_le(value.len() as u32).await?;
             socket.write_all(key).await?;
-            socket.write_u32_le(self.value_size as u32).await?;
             socket.write_all(value).await?;
+
+            match Response::read_response(&mut socket).await? {
+                Response::Ok(_) => {}
+                response => anyhow::bail!("prefill SET {i} failed: {response:?}"),
+            }
         }
 
         Ok(())
+    }
+}
+
+struct Client {
+    socket: TcpStream,
+    rng: SmallRng,
+    read_buf: Vec<u8>,
+}
+
+impl Client {
+    async fn connect(server_addr: &str, space: &KeySpace) -> Result<Self> {
+        let socket = TcpStream::connect(server_addr).await?;
+        socket.set_nodelay(true)?;
+
+        Ok(Self {
+            socket,
+            rng: SmallRng::from_rng(&mut rng()),
+            read_buf: Vec::with_capacity(HEADER_LEN + space.key_size + space.value_size),
+        })
+    }
+
+    async fn run(
+        &mut self,
+        space: &KeySpace,
+        workload: Workload,
+        read_percent: u8,
+        operations: usize,
+    ) -> Result<()> {
+        for _ in 0..operations {
+            let key_index = self.rng.random_range(0..space.len());
+            let key = space.get_key(key_index);
+
+            let is_get = match workload {
+                Workload::Read => true,
+                Workload::Write => false,
+                Workload::ReadOverwrite => self.rng.random_range(0u8..100) < read_percent,
+            };
+
+            if is_get {
+                encode_get(&mut self.read_buf, key);
+            } else {
+                let value_index = self.rng.random_range(0..space.len());
+                encode_set(&mut self.read_buf, key, space.get_value(value_index));
+            }
+
+            self.socket.write_all(&self.read_buf).await?;
+            check_response(&mut self.socket, is_get).await?;
+        }
+
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn encode_get(buffer: &mut Vec<u8>, key: &[u8]) {
+    buffer.clear();
+    buffer.push(OP_GET);
+    buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(key);
+}
+
+#[inline(always)]
+fn encode_set(buffer: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    buffer.clear();
+    buffer.push(OP_SET);
+    buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(key);
+    buffer.extend_from_slice(value);
+}
+
+#[inline(always)]
+async fn check_response(socket: &mut TcpStream, is_get: bool) -> Result<()> {
+    match Response::read_response(socket).await? {
+        Response::Ok(_) if !is_get => Ok(()),
+        Response::KeyValue(_) if is_get => Ok(()),
+        response => anyhow::bail!(
+            "{} failed: {response:?}",
+            if is_get { "GET" } else { "SET" }
+        ),
     }
 }

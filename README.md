@@ -42,6 +42,32 @@ pub enum Response {
 OK/Pong/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError = 0x00/0x01/0x02/0x03/0x04/0x05/0x06 -
 `(1B status|4B value_length|value|)` (All are Little Endian)
 
+**Benchmarks**
+
+```terminaloutput
+mini-bench --workload read-overwrite
+
+mini-db e2e benchmark
+  server:    127.0.0.1:8787
+  workload:  ReadOverwrite
+  clients:   32
+  ops:       256000
+  keyspace:  16384
+  key/value: 16/128 bytes
+  mix:       80% GET / 20% SET
+  warmup:    1024
+
+prefilling 16384 keys... done in 2.01s
+warming up with 1024 operations... done in 20.28ms
+
+running 256000 sampled operations
+
+Results
+  completed:  256000
+  elapsed:    4.269 s
+  throughput: 59969 ops/s
+```
+
 **TODO**
 
 - Multiple DB workers (Sharding and Synchronization)

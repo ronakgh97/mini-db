@@ -78,11 +78,14 @@ impl Wal {
 
                     // least ~15 bytes min per entry (1 op + 4 klen + 4 vlen + 1 key + 1 val + 4 crc)
                     let mut map_index: HashMap<Bytes, Bytes> =
-                        HashMap::with_capacity((len / 15).max(64));
+                        HashMap::with_capacity((len / 15).clamp(64, 1 << 20));
 
                     while offset + (HEADER_LEN + CRC_LEN) <= len {
                         // parse headers
                         let op = data[offset];
+                        if op != OP_SET && op != OP_DELETE {
+                            break; // bad op
+                        }
 
                         // parse read lengths
                         let klen = u32::from_le_bytes([
@@ -97,6 +100,16 @@ impl Wal {
                             data[offset + 7],
                             data[offset + 8],
                         ]) as usize;
+
+                        // although append rejects these on write
+                        // boot should still check these
+                        if klen == 0 {
+                            break;
+                        }
+                        if op == OP_DELETE && vlen != 0 {
+                            break;
+                        }
+
                         let total_len = HEADER_LEN + klen + vlen + CRC_LEN;
 
                         // trailing incomplete unexpected entry
@@ -142,9 +155,8 @@ impl Wal {
                             OP_DELETE => {
                                 map_index.remove(&key as &[u8]);
                             }
-                            _ => {
-                                unreachable!("op can only be SET(1) or DELETE(2), got {op}");
-                            }
+                            // Checked above, but break (truncate) instead of panicking
+                            _ => break,
                         }
                         offset += total_len;
                         count += 1;

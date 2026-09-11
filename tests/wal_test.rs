@@ -264,3 +264,56 @@ async fn offsets_are_monotonic_record_starts() -> anyhow::Result<()> {
     cleanup(&path).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn crc_correct_bogus_op_tail_is_truncated_not_panicking() -> anyhow::Result<()> {
+    let path = tmp_path("bogus-op-crc");
+    cleanup(&path).await;
+
+    let (mut wal, _) = Wal::init(path.clone()).await?;
+    wal.append(OP_SET, &Bytes::from("k1"), &Bytes::from("v1"))
+        .await?;
+    wal.fsync().await?;
+    let good_len = tokio::fs::metadata(&path).await?.len();
+    drop(wal);
+
+    // Bogus op=99 WITH valid CRC: must truncate, never hit unreachable!/panic.
+    {
+        use tokio::io::AsyncWriteExt;
+        let op = 99u8;
+        let key = b"x";
+        let value = b"y";
+        let mut h = crc32fast::Hasher::new();
+        h.update(&[op]);
+        h.update(&1u32.to_le_bytes());
+        h.update(&1u32.to_le_bytes());
+        h.update(key);
+        h.update(value);
+        let crc = h.finalize();
+
+        let mut tail = Vec::with_capacity(9 + 1 + 1 + 4);
+        tail.push(op);
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(key);
+        tail.extend_from_slice(value);
+        tail.extend_from_slice(&crc.to_le_bytes());
+
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        f.write_all(&tail).await?;
+        f.flush().await?;
+    }
+
+    let (wal2, map) = Wal::init(path.clone()).await?;
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get(&Bytes::from("k1")).unwrap(), &Bytes::from("v1"));
+    assert_eq!(wal2.next_offset(), good_len);
+    assert_eq!(tokio::fs::metadata(&path).await?.len(), good_len);
+
+    cleanup(&path).await;
+    Ok(())
+}

@@ -4,7 +4,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use mini_db::log::{LOG_LEVEL, Level};
 use mini_db::protocol::{Operation, Response};
-use mini_db::wal::Wal;
+use mini_db::wal::{HEADER_LEN, Wal};
 use mini_db::worker::{DatabaseOperation, DatabaseWorker};
 use mini_db::{START_TIME, debug, error, info};
 use std::path::PathBuf;
@@ -139,7 +139,7 @@ async fn run_server(
             }
             res = listener.accept() => {
                 match res {
-                    Ok((mut socket, addr)) => {
+                    Ok((socket, addr)) => {
                         debug!("Accepted connections from {}", addr);
                         active_connections.fetch_add(1, Ordering::AcqRel); // inc active connections count
                         let active_connections = active_connections.clone(); // clone for the spawned task, dec when returns
@@ -147,7 +147,7 @@ async fn run_server(
                         // clone for main sender, for each client connected
                         let client_handler = client_handler.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(&mut socket, max_key_size, max_value_size, client_handler).await {
+                            if let Err(e) = handle_client(socket, max_key_size, max_value_size, client_handler).await {
                                 if is_connection_error(&e) {
                                     debug!("Client (ip: {}) disconnected", addr);
                                 } else {
@@ -192,12 +192,15 @@ fn is_connection_error(e: &anyhow::Error) -> bool {
 }
 
 pub async fn handle_client(
-    socket: &mut TcpStream,
+    mut socket: TcpStream,
     max_key_size: usize,
     max_value_size: usize,
     client_handler: mpsc::Sender<DatabaseOperation>,
 ) -> Result<()> {
     socket.nodelay()?; // disable Nagle's algorithm
+
+    // reusable buffer for reading from socket, to avoid repeated allocations inside loop
+    let mut read_buf = BytesMut::with_capacity(HEADER_LEN + max_key_size + max_value_size);
 
     loop {
         let (worker_result, client_response) = oneshot::channel::<Result<Response>>();
@@ -219,22 +222,23 @@ pub async fn handle_client(
                     let key_size = socket.read_u32_le().await? as usize;
 
                     // validate key size before reading the key from the socket
-                    validate_key(key_size, max_key_size, socket).await?;
+                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
 
-                    let mut key_buf = BytesMut::zeroed(key_size);
-                    socket.read_exact(&mut key_buf).await?;
+                    // reuse buffer for later operation
+                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
+                    let key = read_buf.split_to(key_size).freeze();
 
                     // send to DB worker via MPSC queue
                     // TODO; do sharding here later for better performance
                     client_handler
                         .send(DatabaseOperation::GET {
-                            key: key_buf.freeze(),
+                            key,
                             tx: worker_result,
                         })
                         .await?;
 
                     // wait for db to process result from DB worker and send response back to client
-                    send_db_result_to_client(client_response, socket).await?;
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
                 }
 
                 Operation::Set => {
@@ -242,53 +246,52 @@ pub async fn handle_client(
                     let value_size = socket.read_u32_le().await? as usize;
 
                     // validation for key and value
-                    validate_key(key_size, max_key_size, socket).await?;
-                    validate_value(value_size, max_value_size, socket).await?;
+                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
+                    validate_value(value_size, max_value_size, &mut socket, &mut read_buf).await?;
 
-                    let mut key_buf = BytesMut::zeroed(key_size);
-                    socket.read_exact(&mut key_buf).await?;
-
-                    let mut value_buf = BytesMut::zeroed(value_size);
-                    socket.read_exact(&mut value_buf).await?;
+                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
+                    let key = read_buf.split_to(key_size).freeze();
+                    read_exact_reuse_buf(&mut socket, value_size, &mut read_buf).await?;
+                    let value = read_buf.split_to(value_size).freeze();
 
                     // send to DB worker
                     client_handler
                         .send(DatabaseOperation::SET {
-                            key: key_buf.freeze(),
-                            value: value_buf.freeze(),
+                            key,
+                            value,
                             tx: worker_result,
                         })
                         .await?;
 
                     // wait for response from DB worker and send back to client
-                    send_db_result_to_client(client_response, socket).await?;
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
                 }
 
                 Operation::Delete => {
                     let key_size = socket.read_u32_le().await? as usize;
 
                     // validate key only, cuz its DELETE
-                    validate_key(key_size, max_key_size, socket).await?;
+                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
 
-                    let mut key_buf = BytesMut::zeroed(key_size);
-                    socket.read_exact(&mut key_buf).await?;
+                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
+                    let key = read_buf.split_to(key_size).freeze();
 
                     // send to DB worker(s)
                     client_handler
                         .send(DatabaseOperation::DELETE {
-                            key: key_buf.freeze(),
+                            key,
                             tx: worker_result,
                         })
                         .await?;
 
                     // wait for response from DB worker and send back to client
-                    send_db_result_to_client(client_response, socket).await?;
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
                 }
 
                 Operation::Ping => {
                     // send back 'PONG' response with the same payload
                     let rsp = Response::Pong(Bytes::from_static(b"PONG"));
-                    rsp.send_response(socket).await?;
+                    rsp.send_response(&mut socket, &mut read_buf).await?;
                 }
 
                 Operation::Close => {
@@ -298,7 +301,7 @@ pub async fn handle_client(
             },
             None => {
                 let rsp = Response::InvalidRequest(Bytes::from_static(b"Invalid operation code"));
-                rsp.send_response(socket).await?;
+                rsp.send_response(&mut socket, &mut read_buf).await?;
                 return Err(anyhow::anyhow!("Invalid operation code"));
             }
         }
@@ -308,18 +311,41 @@ pub async fn handle_client(
 }
 
 #[inline(always)]
-async fn validate_key(key_size: usize, max_key_size: usize, socket: &mut TcpStream) -> Result<()> {
+async fn read_exact_reuse_buf(
+    socket: &mut TcpStream,
+    len: usize,
+    buf: &mut BytesMut,
+) -> Result<()> {
+    buf.clear();
+    buf.reserve(len);
+    // reserve guarantees capacity,
+    // read_exact overwrites all `len` bytes on success,
+    // on error .clear() so uninit never escapes.
+    unsafe { buf.set_len(len) };
+    match socket.read_exact(buf).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            buf.clear();
+            Err(e.into())
+        }
+    }
+}
+
+#[inline(always)]
+async fn validate_key(
+    key_size: usize,
+    max_key_size: usize,
+    socket: &mut TcpStream,
+    buf: &mut BytesMut,
+) -> Result<()> {
     if key_size == 0 {
         let rsp = Response::InvalidRequest(Bytes::from_static(b"Key size cannot be zero"));
-        rsp.send_response(socket).await?;
+        rsp.send_response(socket, buf).await?;
         return Err(anyhow::anyhow!("Key cannot be empty"));
     }
     if key_size > max_key_size {
-        let rsp = Response::PayloadTooLarge(Bytes::from(format!(
-            "Key size {} exceeds maximum allowed size of {} bytes",
-            key_size, max_key_size
-        )));
-        rsp.send_response(socket).await?;
+        let rsp = Response::PayloadTooLarge(Bytes::from_static(b"Key too large"));
+        rsp.send_response(socket, buf).await?;
         return Err(anyhow::anyhow!(format!(
             "Key size {} exceeds maximum allowed size of {} bytes",
             key_size, max_key_size
@@ -334,18 +360,16 @@ async fn validate_value(
     value_size: usize,
     max_value_size: usize,
     socket: &mut TcpStream,
+    buf: &mut BytesMut,
 ) -> Result<()> {
     if value_size == 0 {
         let rsp = Response::InvalidRequest(Bytes::from_static(b"Value cannot be empty"));
-        rsp.send_response(socket).await?;
+        rsp.send_response(socket, buf).await?;
         return Err(anyhow::anyhow!("Value cannot be empty"));
     }
     if value_size > max_value_size {
-        let rsp = Response::PayloadTooLarge(Bytes::from(format!(
-            "Value size {} exceeds maximum allowed size of {} bytes",
-            value_size, max_value_size
-        )));
-        rsp.send_response(socket).await?;
+        let rsp = Response::PayloadTooLarge(Bytes::from_static(b"Value too large"));
+        rsp.send_response(socket, buf).await?;
         return Err(anyhow::anyhow!(format!(
             "Value size {} exceeds maximum allowed size of {} bytes",
             value_size, max_value_size
@@ -358,22 +382,23 @@ async fn validate_value(
 async fn send_db_result_to_client(
     client_response: oneshot::Receiver<Result<Response>>,
     client_socket: &mut TcpStream,
+    buf: &mut BytesMut,
 ) -> Result<()> {
     match client_response.await {
-        Ok(Ok(response)) => response.send_response(client_socket).await,
+        Ok(Ok(response)) => response.send_response(client_socket, buf).await,
         Ok(Err(e)) => {
             let rsp = Response::InternalError(Bytes::from(format!(
                 "Something went terribly wrong: {}",
                 e
             )));
-            rsp.send_response(client_socket).await?;
+            rsp.send_response(client_socket, buf).await?;
             Err(anyhow::anyhow!("Internal error: {}", e))
         }
         Err(_) => {
             let rsp = Response::InternalError(Bytes::from_static(
                 b"Failed to receive response from worker",
             ));
-            rsp.send_response(client_socket).await?;
+            rsp.send_response(client_socket, buf).await?;
             Err(anyhow::anyhow!("Failed to receive response from worker"))
         }
     }

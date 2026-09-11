@@ -47,7 +47,7 @@ OK/Pong/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError = 0x00
 ```terminaloutput
 mini-bench --workload read-overwrite
 
-mini-db e2e benchmark
+Mini-db e2e benchmark
   server:    127.0.0.1:8787
   workload:  ReadOverwrite
   clients:   32
@@ -57,15 +57,22 @@ mini-db e2e benchmark
   mix:       80% GET / 20% SET
   warmup:    1024
 
-prefilling 16384 keys... done in 2.01s
-warming up with 1024 operations... done in 20.28ms
-
-running 256000 sampled operations
+Prefilling 16384 keys... done in 2.49s
+Warming up with 1024 operations... done in 26.90ms
+Running 256000 sampled operations
 
 Results
   completed:  256000
-  elapsed:    4.269 s
-  throughput: 59969 ops/s
+  elapsed:    5.968 s
+  throughput: 42896 ops/s
+  min:        22.000 us
+  mean:       744.475 us
+  p50:        707.900 us
+  p90:        1.215 ms
+  p95:        1.277 ms
+  p99:        1.422 ms
+  p99.9:      1.808 ms
+  max:        11.157 ms
 ```
 
 **TODO**

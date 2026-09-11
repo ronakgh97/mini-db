@@ -1,6 +1,5 @@
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
-use std::io::IoSlice;
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -52,66 +51,35 @@ pub enum Response {
 }
 
 impl Response {
-    /// Send the length-prefixed response over the given TCP stream.
-    pub async fn send_response(&self, socket: &mut TcpStream) -> Result<()> {
+    #[inline(always)]
+    fn code_and_payload(&self) -> (u8, &[u8]) {
         match self {
-            Response::Ok(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 0;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
-            Response::Pong(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 1;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
-            Response::KeyValue(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 2;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
-            Response::KeyNotFound(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 3;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
-            Response::InvalidRequest(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 4;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
-            Response::PayloadTooLarge(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 5;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
-            Response::InternalError(payload) => {
-                let mut header = [0u8; 5];
-                header[0] = 6;
-                header[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-                let bufs = [IoSlice::new(&header), IoSlice::new(payload)];
-                let _ = socket.write_vectored(&bufs).await?;
-            }
+            Response::Ok(p) => (0, p),
+            Response::Pong(p) => (1, p),
+            Response::KeyValue(p) => (2, p),
+            Response::KeyNotFound(p) => (3, p),
+            Response::InvalidRequest(p) => (4, p),
+            Response::PayloadTooLarge(p) => (5, p),
+            Response::InternalError(p) => (6, p),
         }
+    }
+
+    /// Send the length-prefixed response over the given TCP stream.
+    pub async fn send_response(
+        &self,
+        socket: &mut TcpStream,
+        write_buf: &mut BytesMut,
+    ) -> Result<()> {
+        let (code, payload) = self.code_and_payload();
+
+        write_buf.clear();
+        write_buf.reserve(1 + 4 + payload.len());
+        write_buf.put_u8(code);
+        write_buf.put_u32_le(payload.len() as u32);
+        write_buf.put_slice(payload);
+
+        // single syscall
+        socket.write_all(write_buf).await?;
         Ok(())
     }
 
@@ -119,7 +87,7 @@ impl Response {
     pub async fn read_response(socket: &mut TcpStream) -> Result<Self> {
         let status = socket.read_u8().await?;
         let len = socket.read_u32_le().await? as usize;
-        let mut payload = BytesMut::zeroed(len);
+        let mut payload = BytesMut::zeroed(len); // unsafe set_len may escape uninit memory
         socket.read_exact(&mut payload).await?;
 
         let payload = payload.freeze(); // convert to immutable Bytes

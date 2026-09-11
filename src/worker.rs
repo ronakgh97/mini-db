@@ -79,7 +79,11 @@ impl DatabaseWorker {
                         let _ = tx.send(Err(e));
                         continue;
                     }
-                    self.memory_index.insert(key, value);
+                    // incoming key/value are split_to() slices,
+                    // sharing the connection's reusable read buffer, moving them
+                    // into the index would pin that whole buffer per key
+                    self.memory_index
+                        .insert(Bytes::copy_from_slice(&key), Bytes::copy_from_slice(&value));
                     let _ = tx.send(Ok(Response::Ok(Bytes::from_static(b"OK"))));
                 }
 

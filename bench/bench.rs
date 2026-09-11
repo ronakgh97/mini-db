@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
 
     // assume fresh DB, so SET does not need to prefill keys, it's not ReadOverwrite
     if args.workload != Workload::Write {
-        print!("prefilling {} keys...", args.keyspace);
+        print!("Prefilling {} keys...", args.keyspace);
         let start = Instant::now();
         kv_space
             .fill_db_server(&args.server_addr)
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     let workload = args.workload;
     let read_percent = args.read_percent;
 
-    print!("warming up with {} operations...", args.warmup);
+    print!("Warming up with {} operations...", args.warmup);
     let start = Instant::now();
     let mut warmup_tasks = JoinSet::new();
     for (id, mut client) in clients.into_iter().enumerate() {
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
         let operations = share_workload(args.warmup, args.clients, id);
 
         warmup_tasks.spawn(async move {
-            client
+            let _ = client
                 .run(&space, workload, read_percent, operations)
                 .await
                 .with_context(|| format!("warming up client {id}"))?;
@@ -131,17 +131,16 @@ async fn main() -> Result<()> {
         tasks.spawn(async move {
             barrier.wait().await;
 
-            client
+            let lat_ns = client
                 .run(&space, workload, read_percent, operations)
                 .await
                 .with_context(|| format!("running client {id}"))?;
 
-            Ok::<_, anyhow::Error>((operations, Instant::now()))
+            Ok::<_, anyhow::Error>((operations, lat_ns, Instant::now()))
         });
     }
 
-    println!();
-    println!("running {} sampled operations", args.operations);
+    println!("Running {} sampled operations", args.operations);
 
     // start measured run
     let started = Instant::now();
@@ -149,15 +148,28 @@ async fn main() -> Result<()> {
 
     let mut completed = 0;
     let mut finished = started;
+    let mut lat_ns = Vec::with_capacity(args.operations);
 
     while let Some(result) = tasks.join_next().await {
-        let (operations, client_finished) = result.context("benchmark task panicked")??;
+        let (operations, mut task_lat, client_finished) =
+            result.context("benchmark task panicked")??;
 
         completed += operations;
         finished = finished.max(client_finished);
+        lat_ns.append(&mut task_lat);
     }
 
     let elapsed = finished.duration_since(started);
+    ensure!(
+        lat_ns.len() == completed,
+        "recorded {} ops, expected {}",
+        lat_ns.len(),
+        completed
+    );
+    lat_ns.sort_unstable();
+
+    let total: u128 = lat_ns.iter().map(|&n| u128::from(n)).sum();
+    let mean = total / lat_ns.len() as u128;
 
     println!();
     println!("Results");
@@ -167,12 +179,38 @@ async fn main() -> Result<()> {
         "  throughput: {:.0} ops/s",
         completed as f64 / elapsed.as_secs_f64()
     );
+    println!("  min:        {}", fmt_ns(u128::from(lat_ns[0])));
+    println!("  mean:       {}", fmt_ns(mean));
+    println!(
+        "  p50:        {}",
+        fmt_ns(u128::from(percentile(&lat_ns, 0.50)))
+    );
+    println!(
+        "  p90:        {}",
+        fmt_ns(u128::from(percentile(&lat_ns, 0.90)))
+    );
+    println!(
+        "  p95:        {}",
+        fmt_ns(u128::from(percentile(&lat_ns, 0.95)))
+    );
+    println!(
+        "  p99:        {}",
+        fmt_ns(u128::from(percentile(&lat_ns, 0.99)))
+    );
+    println!(
+        "  p99.9:      {}",
+        fmt_ns(u128::from(percentile(&lat_ns, 0.999)))
+    );
+    println!(
+        "  max:        {}",
+        fmt_ns(u128::from(*lat_ns.last().expect("latencies are non-empty")))
+    );
 
     Ok(())
 }
 
 fn print_config(args: &Args) {
-    println!("mini-db e2e benchmark");
+    println!("Mini-db e2e benchmark");
     println!("  server:    {}", args.server_addr);
     println!("  workload:  {:?}", args.workload);
     println!("  clients:   {}", args.clients);
@@ -299,7 +337,9 @@ impl Client {
         workload: Workload,
         read_percent: u8,
         operations: usize,
-    ) -> Result<()> {
+    ) -> Result<Vec<u64>> {
+        let mut lat_ns = Vec::with_capacity(operations);
+
         for _ in 0..operations {
             let key_index = self.rng.random_range(0..space.len());
             let key = space.get_key(key_index);
@@ -317,11 +357,13 @@ impl Client {
                 encode_set(&mut self.read_buf, key, space.get_value(value_index));
             }
 
+            let started = Instant::now();
             self.socket.write_all(&self.read_buf).await?;
             check_response(&mut self.socket, is_get).await?;
+            lat_ns.push(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         }
 
-        Ok(())
+        Ok(lat_ns)
     }
 }
 
@@ -352,5 +394,24 @@ async fn check_response(socket: &mut TcpStream, is_get: bool) -> Result<()> {
             "{} failed: {response:?}",
             if is_get { "GET" } else { "SET" }
         ),
+    }
+}
+
+#[inline(always)]
+fn percentile(sorted: &[u64], q: f64) -> u64 {
+    let rank = (q * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+#[inline(always)]
+fn fmt_ns(ns: u128) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.3} s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.3} ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.3} us", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns} ns")
     }
 }

@@ -1,0 +1,4 @@
+[build]
+jobs = 18
+# change this to whatever you like
+rustflags = ["-C", "target-cpu=native"]

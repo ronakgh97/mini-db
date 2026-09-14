@@ -75,10 +75,10 @@ Results
   max:        11.157 ms
 ```
 
-**TODO**
+**TODO**    
 
 - Multiple DB workers (Sharding and Synchronization)
 - Faster to memory index for read operations (Rwlock)
 - Multiple segmented WALs
 - Fsync infrequently and group commits
-- Multi-tenancy and proper userspaces
+- Multi-tenancy and proper userspace

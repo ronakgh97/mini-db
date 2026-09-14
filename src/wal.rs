@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use crc32fast::Hasher;
 use memmap2::Mmap;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
@@ -32,7 +32,7 @@ pub struct Wal {
 
 impl Wal {
     /// Open or create WAL file, recover from torn/corrupt tail, and return WAL handle and rebuilt memory index.
-    pub async fn init(file_path: PathBuf) -> Result<(Self, HashMap<Bytes, Bytes>)> {
+    pub async fn init(file_path: PathBuf) -> Result<(Self, FxHashMap<Bytes, Bytes>)> {
         if let Some(parent) = file_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -56,7 +56,7 @@ impl Wal {
                     crc32_hasher: Hasher::default(),
                     write_buf: BytesMut::with_capacity(4 * 1024),
                 },
-                HashMap::with_capacity(64),
+                FxHashMap::with_capacity_and_hasher(64, Default::default()),
             ));
         }
 
@@ -67,7 +67,7 @@ impl Wal {
                 // so we can't spam it in loop
                 let mut crc32_hasher = Hasher::default();
 
-                move || -> Result<(u64, u64, Hasher, HashMap<Bytes, Bytes>)> {
+                move || -> Result<(u64, u64, Hasher, FxHashMap<Bytes, Bytes>)> {
                     let file = std::fs::File::open(&path)?;
                     let mmap = unsafe { Mmap::map(&file)? };
 
@@ -77,8 +77,11 @@ impl Wal {
                     let mut offset = 0usize;
 
                     // least ~15 bytes min per entry (1 op + 4 klen + 4 vlen + 1 key + 1 val + 4 crc)
-                    let mut map_index: HashMap<Bytes, Bytes> =
-                        HashMap::with_capacity((len / 15).clamp(64, 1 << 20));
+                    let mut map_index: FxHashMap<Bytes, Bytes> =
+                        FxHashMap::with_capacity_and_hasher(
+                            (len / 15).clamp(64, 1 << 20),
+                            Default::default(),
+                        );
 
                     while offset + (HEADER_LEN + CRC_LEN) <= len {
                         // parse headers
@@ -240,7 +243,7 @@ impl Wal {
 
     /// Build/Recover index of the keys and values in the WAL file.
     #[allow(unused)]
-    fn build_index(&self) -> Result<HashMap<Bytes, Bytes>> {
+    fn build_index(&self) -> Result<FxHashMap<Bytes, Bytes>> {
         unimplemented!()
     }
 
@@ -252,17 +255,26 @@ impl Wal {
         Ok(())
     }
 
+    /// Get the size of the WAL file on disk.
+    #[inline]
+    pub fn size_on_disk(&self) -> u64 {
+        self.file_len
+    }
+
     /// Get the offset of the next entry to be written.
+    #[inline]
     pub fn next_offset(&self) -> u64 {
         self.file_len
     }
 
     /// Get the number of entries written to the WAL file.
+    #[inline]
     pub fn entry_count(&self) -> u64 {
         self.entry_count
     }
 
     /// Get the path of the WAL file.
+    #[inline]
     pub fn path(&self) -> &Path {
         &self.file_path
     }

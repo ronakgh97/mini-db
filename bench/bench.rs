@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
-use mini_db::protocol::Response;
+use mini_db::protocol::{Operation, Response};
 use mini_db::wal::HEADER_LEN;
 use rand::rngs::SmallRng;
 use rand::{Rng, RngExt, SeedableRng, rng};
@@ -10,9 +10,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
-
-const OP_GET: u8 = 0;
-const OP_SET: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Workload {
@@ -39,6 +36,10 @@ struct Args {
     /// Total number of operations across all clients.
     #[arg(long, default_value_t = 256_000)]
     operations: usize,
+
+    /// Database name to operate on.
+    #[arg(long, default_value = "default")]
+    db_name: String,
 
     /// Number of distinct keys used by the workload.
     #[arg(long, default_value_t = 16_384)]
@@ -82,15 +83,16 @@ async fn main() -> Result<()> {
         print!("Prefilling {} keys...", args.keyspace);
         let start = Instant::now();
         kv_space
-            .fill_db_server(&args.server_addr)
+            .fill_db_server(&args.server_addr, &args.db_name)
             .await
             .context("failed to prefill db")?;
         println!(" done in {:.2?}", start.elapsed());
     }
 
     let mut clients = Vec::with_capacity(args.clients);
+    let db_name: Arc<str> = args.db_name.into();
     for _ in 0..args.clients {
-        clients.push(Client::connect(&args.server_addr, &kv_space).await?);
+        clients.push(Client::connect(&args.server_addr, &kv_space, db_name.clone()).await?);
     }
 
     let workload = args.workload;
@@ -212,6 +214,7 @@ async fn main() -> Result<()> {
 fn print_config(args: &Args) {
     println!("Mini-db e2e benchmark");
     println!("  server:    {}", args.server_addr);
+    println!("  db:        {}", args.db_name);
     println!("  workload:  {:?}", args.workload);
     println!("  clients:   {}", args.clients);
     println!("  ops:       {}", args.operations);
@@ -231,6 +234,10 @@ fn print_config(args: &Args) {
 fn validate(args: &Args) -> Result<()> {
     ensure!(args.clients > 0, "--clients must be greater than zero");
     ensure!(args.operations >= 128, "--operations must be at least 128");
+    ensure!(
+        args.db_name.len() <= 255,
+        "--db-name must be at most 255 bytes"
+    );
     ensure!(args.keyspace >= 4096, "--keyspace must be at least 4096");
     ensure!(args.key_size > 0, "--key-size must be greater than zero");
     ensure!(
@@ -241,6 +248,7 @@ fn validate(args: &Args) -> Result<()> {
         args.read_percent < 100 && args.read_percent > 0,
         "--read-percent must be 0..99"
     );
+    ensure!(!args.db_name.is_empty(), "--db-name must not be empty");
     Ok(())
 }
 
@@ -289,17 +297,21 @@ impl KeySpace {
         self.keys.len() / self.key_size
     }
 
-    async fn fill_db_server(&self, server_addr: &str) -> Result<()> {
+    async fn fill_db_server(&self, server_addr: &str, db_name: &str) -> Result<()> {
         let mut socket = TcpStream::connect(server_addr).await?;
         socket.set_nodelay(true)?;
+
+        let db_name_bytes = db_name.as_bytes();
 
         for i in 0..self.len() {
             let key = self.get_key(i);
             let value = self.get_value(i);
 
-            socket.write_u8(OP_SET).await?;
+            socket.write_u8(Operation::Set.to_u8()).await?;
+            socket.write_u8(db_name_bytes.len() as u8).await?;
             socket.write_u32_le(key.len() as u32).await?;
             socket.write_u32_le(value.len() as u32).await?;
+            socket.write_all(db_name_bytes).await?;
             socket.write_all(key).await?;
             socket.write_all(value).await?;
 
@@ -317,17 +329,19 @@ struct Client {
     socket: TcpStream,
     rng: SmallRng,
     read_buf: Vec<u8>,
+    db_name: Arc<str>,
 }
 
 impl Client {
-    async fn connect(server_addr: &str, space: &KeySpace) -> Result<Self> {
+    async fn connect(server_addr: &str, space: &KeySpace, db_name: Arc<str>) -> Result<Self> {
         let socket = TcpStream::connect(server_addr).await?;
         socket.set_nodelay(true)?;
 
         Ok(Self {
             socket,
             rng: SmallRng::from_rng(&mut rng()),
-            read_buf: Vec::with_capacity(HEADER_LEN + space.key_size + space.value_size),
+            read_buf: Vec::with_capacity(HEADER_LEN + 1 + space.key_size + space.value_size),
+            db_name,
         })
     }
 
@@ -351,10 +365,15 @@ impl Client {
             };
 
             if is_get {
-                encode_get(&mut self.read_buf, key);
+                encode_get(&mut self.read_buf, &self.db_name, key);
             } else {
                 let value_index = self.rng.random_range(0..space.len());
-                encode_set(&mut self.read_buf, key, space.get_value(value_index));
+                encode_set(
+                    &mut self.read_buf,
+                    &self.db_name,
+                    key,
+                    space.get_value(value_index),
+                );
             }
 
             let started = Instant::now();
@@ -368,19 +387,23 @@ impl Client {
 }
 
 #[inline(always)]
-fn encode_get(buffer: &mut Vec<u8>, key: &[u8]) {
+fn encode_get(buffer: &mut Vec<u8>, db_name: &str, key: &[u8]) {
     buffer.clear();
-    buffer.push(OP_GET);
+    buffer.push(Operation::Get.to_u8());
+    buffer.push(db_name.len() as u8);
     buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(db_name.as_bytes());
     buffer.extend_from_slice(key);
 }
 
 #[inline(always)]
-fn encode_set(buffer: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+fn encode_set(buffer: &mut Vec<u8>, db_name: &str, key: &[u8], value: &[u8]) {
     buffer.clear();
-    buffer.push(OP_SET);
+    buffer.push(Operation::Set.to_u8());
+    buffer.push(db_name.len() as u8);
     buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
     buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(db_name.as_bytes());
     buffer.extend_from_slice(key);
     buffer.extend_from_slice(value);
 }

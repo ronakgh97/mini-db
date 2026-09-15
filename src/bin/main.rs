@@ -1,11 +1,11 @@
 use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use mini_db::log::{LOG_LEVEL, Level};
 use mini_db::manager::DbManager;
-use mini_db::protocol::{Operation, Response};
+use mini_db::protocol::{Operation, Response, StatsPacket};
 use mini_db::wal::HEADER_LEN;
 use mini_db::worker::DatabaseQueryOperation;
 use mini_db::{MAX_DB_NAME_LEN, START_TIME, debug, error, get_uptime_hrs, info, trace};
@@ -174,6 +174,7 @@ async fn run_server(
 
                         // spawn per client connection task
                         tokio::spawn(async move {
+                            // TODO; if this panics, active_connections will not be decremented and shutdown will wait forever.
                             if let Err(e) = handle_client(
                                 socket,
                                 max_key_size,
@@ -260,12 +261,13 @@ pub async fn handle_client(
                     // - number of databases
                     // - number of active connections
 
-                    let mut stats_packet = BytesMut::with_capacity(12);
-                    stats_packet.put_f64_le(get_uptime_hrs());
-                    stats_packet.put_u32_le(db_manager.db_count() as u32);
-                    stats_packet.put_u32_le(active_connections.load(Ordering::Acquire));
+                    let packet = StatsPacket {
+                        uptime_hrs: get_uptime_hrs(),
+                        total_dbs: db_manager.db_count() as u32,
+                        total_active_connections: active_connections.load(Ordering::Acquire),
+                    };
 
-                    let rsp = Response::Ok(stats_packet.freeze());
+                    let rsp = Response::Ok(packet.to_bytes(&mut read_buf));
                     rsp.send_response(&mut socket, &mut read_buf).await?;
                 }
 

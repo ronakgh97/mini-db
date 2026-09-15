@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -55,6 +55,80 @@ impl Operation {
             Operation::Get => 6,
             Operation::Set => 7,
             Operation::Delete => 8,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatsPacket {
+    pub uptime_hrs: f64,
+    pub total_dbs: u32,
+    pub total_active_connections: u32,
+}
+
+impl StatsPacket {
+    #[inline(always)]
+    pub fn to_bytes(self, write_buf: &mut BytesMut) -> Bytes {
+        write_buf.clear();
+        write_buf.reserve(16);
+        write_buf.put_f64_le(self.uptime_hrs);
+        write_buf.put_u32_le(self.total_dbs);
+        write_buf.put_u32_le(self.total_active_connections);
+        write_buf.split().freeze()
+    }
+    #[inline(always)]
+    pub fn from_bytes(read_buf: &mut Bytes) -> Self {
+        let uptime_hrs = read_buf.get_f64_le();
+        let total_dbs = read_buf.get_u32_le();
+        let total_active_connections = read_buf.get_u32_le();
+        read_buf.clear();
+        StatsPacket {
+            uptime_hrs,
+            total_dbs,
+            total_active_connections,
+        }
+    }
+}
+
+pub struct InfoPacket {
+    pub size_on_disk: u32,
+    pub size_in_memory: u32,
+    pub min_key_size: u32,
+    pub mean_key_size: u32,
+    pub max_key_size: u32,
+    pub key_count: u32,
+}
+
+impl InfoPacket {
+    #[inline(always)]
+    pub fn to_bytes(self, write_buf: &mut BytesMut) -> Bytes {
+        write_buf.clear();
+        write_buf.reserve(24);
+        write_buf.put_u32_le(self.size_on_disk);
+        write_buf.put_u32_le(self.size_in_memory);
+        write_buf.put_u32_le(self.min_key_size);
+        write_buf.put_u32_le(self.mean_key_size);
+        write_buf.put_u32_le(self.max_key_size);
+        write_buf.put_u32_le(self.key_count);
+        write_buf.split().freeze()
+    }
+    #[inline(always)]
+    pub fn from_bytes(read_buf: &mut Bytes) -> Self {
+        let size_on_disk = read_buf.get_u32_le();
+        let size_in_memory = read_buf.get_u32_le();
+        let min_key_size = read_buf.get_u32_le();
+        let mean_key_size = read_buf.get_u32_le();
+        let max_key_size = read_buf.get_u32_le();
+        let key_count = read_buf.get_u32_le();
+        read_buf.clear();
+        InfoPacket {
+            size_on_disk,
+            size_in_memory,
+            min_key_size,
+            mean_key_size,
+            max_key_size,
+            key_count,
         }
     }
 }

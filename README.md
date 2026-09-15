@@ -52,7 +52,7 @@ OK/Pong/DbNotFound/DbAlreadyExists/KeyValue/KeyNotFound/InvalidRequest/PayloadTo
 **Benchmarks**
 
 ```terminaloutput
-mini-bench --workload read-overwrite
+mini-bench --workload read-overwrite  
 
 Mini-db e2e benchmark
   server:    127.0.0.1:8787
@@ -65,22 +65,22 @@ Mini-db e2e benchmark
   mix:       80% GET / 20% SET
   warmup:    1024
 
-Prefilling 16384 keys... done in 1.94s
-Warming up with 1024 operations... done in 14.02ms
+Prefilling 16384 keys... done in 1.55s
+Warming up with 1024 operations... done in 14.44ms
 Running 256000 sampled operations
 
 Results
   completed:  256000
-  elapsed:    3.677 s
-  throughput: 69620 ops/s
-  min:        18.400 us
-  mean:       458.567 us
-  p50:        278.600 us
-  p90:        875.400 us
-  p95:        929.900 us
-  p99:        1.083 ms
-  p99.9:      1.352 ms
-  max:        2.178 ms
+  elapsed:    2.637 s
+  throughput: 97072 ops/s
+  min:        25.000 us
+  mean:       328.860 us
+  p50:        268.400 us
+  p90:        542.300 us
+  p95:        591.200 us
+  p99:        717.900 us
+  p99.9:      940.300 us
+  max:        10.409 ms
 ```
 
 **TODO**

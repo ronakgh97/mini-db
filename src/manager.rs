@@ -1,7 +1,7 @@
 use crate::protocol::Response;
 use crate::wal::Wal;
 use crate::worker::{DatabaseQueryOperation, DatabaseWorker};
-use crate::{DEFAULT_DB_NAME, debug};
+use crate::{DEFAULT_DB_NAME, debug, fmt_bytes};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -49,11 +49,14 @@ impl DbManager {
                     Some(name) => name,
                     None => return Err(anyhow::anyhow!("Invalid log file name")), // TODO; should we continue or return Err?
                 };
+                let file_metadata = entry.metadata().await?;
+                let file_size = file_metadata.len();
 
                 // init WAL + memory index
                 debug!(
-                    "Initializing WAL and spawning workers for database: '{}'",
-                    file_name
+                    "Initializing WAL/Index and spawning DbWorkers for: '{}' (size: {})",
+                    file_name,
+                    fmt_bytes(file_size as usize)
                 );
                 let (wal, memory_index) = Wal::init(path.clone()).await?;
                 let (query_tx, query_rx) = mpsc::channel(max_queue_size);

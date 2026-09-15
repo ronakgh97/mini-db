@@ -1,7 +1,7 @@
-use crate::protocol::Response;
+use crate::protocol::{InfoPacket, Response};
 use crate::wal::{OP_DELETE, OP_SET, Wal};
 use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot::Sender;
@@ -35,9 +35,11 @@ pub struct DatabaseWorker {
     fsync_interval: usize,
     memory_index: FxHashMap<Bytes, Bytes>,
     db_handler: Receiver<DatabaseQueryOperation>,
+    write_buf: BytesMut,
 }
 
 impl DatabaseWorker {
+    /// Initialize a new database worker.
     pub fn init(
         wal: Wal,
         fsync_interval: usize,
@@ -49,6 +51,7 @@ impl DatabaseWorker {
             fsync_interval,
             memory_index,
             db_handler,
+            write_buf: BytesMut::with_capacity(1 << 20), // 1MB buffer for writes
         }
     }
 
@@ -97,19 +100,22 @@ impl DatabaseWorker {
                     let mean_key_size =
                         total_key_size.checked_div(key_count as usize).unwrap_or(0) as u32;
 
+                    // reuse buf to write packet
                     let info_packet = {
-                        let mut packet = BytesMut::with_capacity(24);
-                        packet.put_u32(size_on_disk);
-                        packet.put_u32(size_in_memory);
-                        packet.put_u32(min_key_size);
-                        packet.put_u32(mean_key_size);
-                        packet.put_u32(max_key_size);
-                        packet.put_u32(key_count);
-                        packet
+                        let packet = InfoPacket {
+                            size_on_disk,
+                            size_in_memory,
+                            min_key_size,
+                            mean_key_size,
+                            max_key_size,
+                            key_count,
+                        };
+                        packet.to_bytes(&mut self.write_buf)
                     };
 
-                    let _ = tx.send(Ok(Response::Ok(info_packet.freeze())));
+                    let _ = tx.send(Ok(Response::Ok(info_packet)));
                 }
+
                 DatabaseQueryOperation::GET { key, tx } => {
                     if let Some(value) = self.memory_index.get(&key) {
                         // let _ = because the receiver might have been dropped,

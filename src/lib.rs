@@ -1,10 +1,13 @@
 pub mod log;
+pub mod manager;
 pub mod protocol;
 pub mod wal;
 pub mod worker;
 
 pub const MAX_KEY_SIZE: usize = 2 << 20;
 pub const MAX_VALUE_SIZE: usize = 24 << 20;
+pub const MAX_DB_NAME_LEN: usize = 64;
+pub const DEFAULT_DB_NAME: &str = "default";
 
 pub static START_TIME: std::sync::OnceLock<chrono::DateTime<chrono::Local>> =
     std::sync::OnceLock::new();

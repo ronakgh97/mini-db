@@ -1,7 +1,7 @@
-use crate::DEFAULT_DB_NAME;
 use crate::protocol::Response;
 use crate::wal::Wal;
 use crate::worker::{DatabaseQueryOperation, DatabaseWorker};
+use crate::{DEFAULT_DB_NAME, debug};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -23,12 +23,12 @@ pub struct DbManager {
     fsync_interval: usize,
     max_queue_size: usize,
     db_map: Arc<ArcSwap<FxHashMap<String, DBHandle>>>,
-    write_lock: tokio::sync::Mutex<()>,
+    write_lock: tokio::sync::Mutex<()>, // tiny write lock for NOT risking race conditions like lost-update load
 }
 
 impl DbManager {
     /// Create wal_dir if needed, scan existing `*.log` files, build memory index,
-    /// spawn a worker per DB, and ensure `default.log` exists
+    /// spawn a worker for each DB, and ensure `default.log` exists
     pub async fn init(
         wal_dir: PathBuf,
         fsync_interval: usize,
@@ -39,7 +39,9 @@ impl DbManager {
 
         // iter over wal entries, init memory index, spawn worker for each DB,
         // finally them into the map with exit notifiers
+        let start_time = std::time::Instant::now();
         let mut wal_entries = tokio::fs::read_dir(&wal_dir).await?;
+        debug!("Indexing WAL entries from: {:?}", wal_dir);
         while let Some(entry) = wal_entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("log") {
@@ -49,6 +51,10 @@ impl DbManager {
                 };
 
                 // init WAL + memory index
+                debug!(
+                    "Initializing WAL and spawning workers for database: '{}'",
+                    file_name
+                );
                 let (wal, memory_index) = Wal::init(path.clone()).await?;
                 let (query_tx, query_rx) = mpsc::channel(max_queue_size);
                 let worker_drop_notifier = Arc::new(Notify::new());
@@ -70,6 +76,11 @@ impl DbManager {
                 );
             }
         }
+        debug!(
+            "Indexed {} WAL entries in {:.2?}",
+            dbs.len(),
+            start_time.elapsed()
+        );
 
         // ensure default.log exists
         if !dbs.contains_key(DEFAULT_DB_NAME) {

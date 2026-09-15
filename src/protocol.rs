@@ -7,33 +7,54 @@ use tokio::net::TcpStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Represents the different operations that clients can perform in the mini-db protocol.
 pub enum Operation {
-    Get,
-    Set,
-    Delete,
+    /// Get statistics about the server.
+    Stats,
+    /// Ping the server to check if it's alive.
     Ping,
+    /// Close the connection to the server.
     Close,
+    /// Create a new database.
+    Create,
+    /// Get information about the database.
+    Info,
+    /// Drop an existing database.
+    Drop,
+    /// Get a value for a given key.
+    Get,
+    /// Set a value for a given key.
+    Set,
+    /// Delete a value for a given key.
+    Delete,
 }
 
 impl Operation {
     #[inline(always)]
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(Operation::Get),
-            1 => Some(Operation::Set),
-            2 => Some(Operation::Delete),
-            3 => Some(Operation::Ping),
-            4 => Some(Operation::Close),
+            0 => Some(Operation::Stats),
+            1 => Some(Operation::Ping),
+            2 => Some(Operation::Close),
+            3 => Some(Operation::Create),
+            4 => Some(Operation::Info),
+            5 => Some(Operation::Drop),
+            6 => Some(Operation::Get),
+            7 => Some(Operation::Set),
+            8 => Some(Operation::Delete),
             _ => None,
         }
     }
     #[inline(always)]
     pub fn to_u8(&self) -> u8 {
         match self {
-            Operation::Get => 0,
-            Operation::Set => 1,
-            Operation::Delete => 2,
-            Operation::Ping => 3,
-            Operation::Close => 4,
+            Operation::Stats => 0,
+            Operation::Ping => 1,
+            Operation::Close => 2,
+            Operation::Create => 3,
+            Operation::Info => 4,
+            Operation::Drop => 5,
+            Operation::Get => 6,
+            Operation::Set => 7,
+            Operation::Delete => 8,
         }
     }
 }
@@ -43,6 +64,8 @@ impl Operation {
 pub enum Response {
     Ok(Bytes),
     Pong(Bytes),
+    DbNotFound(Bytes),
+    DbAlreadyExists(Bytes),
     KeyValue(Bytes),
     KeyNotFound(Bytes),
     InvalidRequest(Bytes),
@@ -56,11 +79,16 @@ impl Response {
         match self {
             Response::Ok(p) => (0, p),
             Response::Pong(p) => (1, p),
-            Response::KeyValue(p) => (2, p),
-            Response::KeyNotFound(p) => (3, p),
-            Response::InvalidRequest(p) => (4, p),
-            Response::PayloadTooLarge(p) => (5, p),
-            Response::InternalError(p) => (6, p),
+
+            Response::DbNotFound(p) => (2, p),
+            Response::DbAlreadyExists(p) => (3, p),
+
+            Response::KeyValue(p) => (4, p),
+            Response::KeyNotFound(p) => (5, p),
+
+            Response::InvalidRequest(p) => (6, p),
+            Response::PayloadTooLarge(p) => (7, p),
+            Response::InternalError(p) => (8, p),
         }
     }
 
@@ -94,11 +122,13 @@ impl Response {
         match status {
             0 => Ok(Response::Ok(payload)),
             1 => Ok(Response::Pong(payload)),
-            2 => Ok(Response::KeyValue(payload)),
-            3 => Ok(Response::KeyNotFound(payload)),
-            4 => Ok(Response::InvalidRequest(payload)),
-            5 => Ok(Response::PayloadTooLarge(payload)),
-            6 => Ok(Response::InternalError(payload)),
+            2 => Ok(Response::DbNotFound(payload)),
+            3 => Ok(Response::DbAlreadyExists(payload)),
+            4 => Ok(Response::KeyValue(payload)),
+            5 => Ok(Response::KeyNotFound(payload)),
+            6 => Ok(Response::InvalidRequest(payload)),
+            7 => Ok(Response::PayloadTooLarge(payload)),
+            8 => Ok(Response::InternalError(payload)),
             _ => Ok(Response::InternalError(Bytes::from(format!(
                 "Unknown response code: {}",
                 status

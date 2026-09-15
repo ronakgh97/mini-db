@@ -1,22 +1,25 @@
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Local;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use mini_db::log::{LOG_LEVEL, Level};
+use mini_db::manager::DbManager;
 use mini_db::protocol::{Operation, Response};
-use mini_db::wal::{HEADER_LEN, Wal};
-use mini_db::worker::{DatabaseOperation, DatabaseWorker};
-use mini_db::{START_TIME, debug, error, info};
+use mini_db::wal::HEADER_LEN;
+use mini_db::worker::DatabaseQueryOperation;
+use mini_db::{MAX_DB_NAME_LEN, START_TIME, debug, error, get_uptime_hrs, info, trace};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::oneshot;
 
 #[derive(Parser)]
 #[command(
     name = "mini-db",
+    author = "ronakgh97 <ronakgh97@gmail.com>",
     version = "v1.0.0",
     about = "High-performance WAL-based key-value database",
     long_about = "High-performance WAL-based key-value database"
@@ -34,7 +37,7 @@ enum CliArgs {
         server_addr: String,
 
         /// Number of database operation that single worker can handle concurrently
-        #[arg(long, default_value = "1024")]
+        #[arg(long, default_value = "2048")]
         max_queue_size: usize,
 
         /// Maximum size of a key in bytes
@@ -46,15 +49,19 @@ enum CliArgs {
         max_value_size: usize,
 
         /// Interval for syncing the write-ahead log to disk (in number of write-operations)
-        #[arg(long, default_value = "6")]
+        #[arg(long, default_value = "16")]
         fsync_interval: usize,
 
-        /// Path to the write-ahead log file
-        #[arg(long, default_value = "wal.log")]
-        wal_path: PathBuf,
+        /// Whether to enable lazy indexing (default: false)
+        #[arg(long, default_value = "false")]
+        lazy_indexing: bool,
+
+        /// Path to the write-ahead log directory (default: "./mini-logs/")
+        #[arg(long, default_value = "./mini-logs/")]
+        wal_dir: PathBuf,
 
         /// Level of verbosity for logging
-        #[arg(long, default_value = "info")]
+        #[arg(long, default_value = "debug")]
         log_level: Level,
     },
 }
@@ -70,16 +77,19 @@ async fn main() -> Result<()> {
             max_value_size,
             max_queue_size,
             fsync_interval,
-            wal_path,
+            wal_dir,
+            lazy_indexing,
             log_level,
         } => {
+            print_ascii_art();
             run_server(
                 server_addr,
                 max_key_size,
                 max_value_size,
                 max_queue_size,
                 fsync_interval,
-                wal_path,
+                lazy_indexing,
+                wal_dir,
                 log_level,
             )
             .await?;
@@ -89,13 +99,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn print_ascii_art() {
+    let art = r#"
+                               ▄▄ ▄▄
+         ▀▀        ▀▀          ██ ██
+███▄███▄ ██  ████▄ ██       ▄████ ████▄
+██ ██ ██ ██  ██ ██ ██ ▀▀▀▀▀ ██ ██ ██ ██
+██ ██ ██ ██▄ ██ ██ ██▄      ▀████ ████▀
+"#;
+    print!("{}", art.bold().cyan());
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_server(
     addr: String,
     max_key_size: usize,
     max_value_size: usize,
     max_queue_size: usize,
     fsync_interval: usize,
-    wal_path: PathBuf,
+    #[allow(unused)] lazy_indexing: bool, // TODO; implement lazy indexing managed by DManager
+    wal_dir: PathBuf,
     log_level: Level,
 ) -> Result<()> {
     START_TIME
@@ -104,21 +127,23 @@ async fn run_server(
     LOG_LEVEL.set(log_level).expect("Failed to set LOG_LEVEL");
 
     info!("Performing necessary initialization...");
-    // init wal and build memory index if available
-    let (wal, map_index) = Wal::init(wal_path).await?;
+    let db_manager = Arc::new(DbManager::init(wal_dir, fsync_interval, max_queue_size).await?);
 
-    // init database worker(s) and mpsc channel for communication
-    let (client_handler, db_handler) = mpsc::channel::<DatabaseOperation>(max_queue_size);
-    let mut db_worker = DatabaseWorker::init(wal, fsync_interval, map_index, db_handler);
-
-    tokio::spawn(async move {
-        if let Err(e) = db_worker.execute_operations().await {
-            error!("Database worker encountered an error: {:?}", e);
-        }
-    });
+    // // init wal and build memory index if available
+    // let (wal, map_index) = Wal::init(wal_path).await?;
+    //
+    // // init database worker(s) and mpsc channel for communication
+    // let (client_handler, db_handler) = mpsc::channel::<DatabaseOperation>(max_queue_size);
+    // let mut db_worker = DatabaseWorker::init(wal, fsync_interval, map_index, db_handler);
+    //
+    // tokio::spawn(async move {
+    //     if let Err(e) = db_worker.execute_operations().await {
+    //         error!("Database worker encountered an error: {:?}", e);
+    //     }
+    // });
 
     // init necessary shared state for graceful shutdown
-    let shutdown_notifier = Arc::new(Notify::new());
+    // let shutdown_notifier = Arc::new(Notify::new());
     let active_connections = Arc::new(AtomicU32::new(0));
 
     // finally start the server after all initialization is done
@@ -134,27 +159,35 @@ async fn run_server(
         tokio::select! {
             _ = ctrl_c_handler() => {
                 info!("Shutdown signal received, stopping server...");
-                shutdown_notifier.notify_waiters();
+                // shutdown_notifier.notify_waiters();
                 break;
             }
             res = listener.accept() => {
                 match res {
                     Ok((socket, addr)) => {
-                        debug!("Accepted connections from {}", addr);
+                        trace!("Accepted connections from {}", addr);
                         active_connections.fetch_add(1, Ordering::AcqRel); // inc active connections count
-                        let active_connections = active_connections.clone(); // clone for the spawned task, dec when returns
 
-                        // clone for main sender, for each client connected
-                        let client_handler = client_handler.clone();
+                        let db_manager_clone = db_manager.clone(); // client needs to send queries to DB manager
+                        let active_connections_clone = active_connections.clone(); // clone for dec on task completion
+                        let active_connections_task_clone = active_connections_clone.clone(); // clone for stats operation
+
+                        // spawn per client connection task
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(socket, max_key_size, max_value_size, client_handler).await {
+                            if let Err(e) = handle_client(
+                                socket,
+                                max_key_size,
+                                max_value_size,
+                                active_connections_task_clone,
+                                db_manager_clone
+                            ).await {
                                 if is_connection_error(&e) {
                                     debug!("Client (ip: {}) disconnected", addr);
                                 } else {
                                     error!("Error handling client (ip: {}): {:?}", addr, e);
                                 }
                             };
-                            active_connections.fetch_sub(1, Ordering::AcqRel);
+                            active_connections_clone.fetch_sub(1, Ordering::AcqRel);
                         });
                     }
                     Err(e) => {
@@ -172,9 +205,11 @@ async fn run_server(
     );
 
     // wait for all active connections to finish before shutting down (returning to main)
+    // TODO: polling is fine for small active connections
     while active_connections.load(Ordering::Acquire) != 0 {
         tokio::task::yield_now().await;
     }
+    db_manager.shutdown_all_workers().await; // shutdown all workers gracefully
     info!("Server has stopped");
 
     Ok(())
@@ -195,7 +230,8 @@ pub async fn handle_client(
     mut socket: TcpStream,
     max_key_size: usize,
     max_value_size: usize,
-    client_handler: mpsc::Sender<DatabaseOperation>,
+    active_connections: Arc<AtomicU32>,
+    db_manager: Arc<DbManager>,
 ) -> Result<()> {
     socket.nodelay()?; // disable Nagle's algorithm
 
@@ -203,7 +239,7 @@ pub async fn handle_client(
     let mut read_buf = BytesMut::with_capacity(HEADER_LEN + max_key_size + max_value_size);
 
     loop {
-        let (worker_result, client_response) = oneshot::channel::<Result<Response>>();
+        let (db_result, client_response) = oneshot::channel::<Result<Response>>();
 
         let op = match socket.read_u8().await {
             Ok(op) => op,
@@ -218,74 +254,19 @@ pub async fn handle_client(
 
         match Operation::from_u8(op) {
             Some(op) => match op {
-                Operation::Get => {
-                    let key_size = socket.read_u32_le().await? as usize;
+                Operation::Stats => {
+                    // Stats contains
+                    // - server uptime in hours
+                    // - number of databases
+                    // - number of active connections
 
-                    // validate key size before reading the key from the socket
-                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
+                    let mut stats_packet = BytesMut::with_capacity(12);
+                    stats_packet.put_f64_le(get_uptime_hrs());
+                    stats_packet.put_u32_le(db_manager.db_count() as u32);
+                    stats_packet.put_u32_le(active_connections.load(Ordering::Acquire));
 
-                    // reuse buffer for later operation
-                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
-                    let key = read_buf.split_to(key_size).freeze();
-
-                    // send to DB worker via MPSC queue
-                    // TODO; do sharding here later for better performance
-                    client_handler
-                        .send(DatabaseOperation::GET {
-                            key,
-                            tx: worker_result,
-                        })
-                        .await?;
-
-                    // wait for db to process result from DB worker and send response back to client
-                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
-                }
-
-                Operation::Set => {
-                    let key_size = socket.read_u32_le().await? as usize;
-                    let value_size = socket.read_u32_le().await? as usize;
-
-                    // validation for key and value
-                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
-                    validate_value(value_size, max_value_size, &mut socket, &mut read_buf).await?;
-
-                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
-                    let key = read_buf.split_to(key_size).freeze();
-                    read_exact_reuse_buf(&mut socket, value_size, &mut read_buf).await?;
-                    let value = read_buf.split_to(value_size).freeze();
-
-                    // send to DB worker
-                    client_handler
-                        .send(DatabaseOperation::SET {
-                            key,
-                            value,
-                            tx: worker_result,
-                        })
-                        .await?;
-
-                    // wait for response from DB worker and send back to client
-                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
-                }
-
-                Operation::Delete => {
-                    let key_size = socket.read_u32_le().await? as usize;
-
-                    // validate key only, cuz its DELETE
-                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
-
-                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
-                    let key = read_buf.split_to(key_size).freeze();
-
-                    // send to DB worker(s)
-                    client_handler
-                        .send(DatabaseOperation::DELETE {
-                            key,
-                            tx: worker_result,
-                        })
-                        .await?;
-
-                    // wait for response from DB worker and send back to client
-                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
+                    let rsp = Response::Ok(stats_packet.freeze());
+                    rsp.send_response(&mut socket, &mut read_buf).await?;
                 }
 
                 Operation::Ping => {
@@ -297,6 +278,159 @@ pub async fn handle_client(
                 Operation::Close => {
                     // client wants to close the connection, break the loop and close gracefully
                     break;
+                }
+
+                Operation::Create => {
+                    let db_name_len = socket.read_u8().await? as usize;
+
+                    read_exact_reuse_buf(&mut socket, db_name_len, &mut read_buf).await?; // reuse buffer for later operation
+                    let db_name_buf = read_buf.split_to(db_name_len).freeze();
+                    let db_name =
+                        validate_db_name(&db_name_buf, &mut socket, &mut read_buf).await?;
+
+                    let rsp = db_manager.create_db(db_name).await?; // holds TINY write lock, read path are lock-free (atomic swap)
+                    rsp.send_response(&mut socket, &mut read_buf).await?;
+                }
+
+                Operation::Info => {
+                    let db_name_len = socket.read_u8().await? as usize;
+
+                    read_exact_reuse_buf(&mut socket, db_name_len, &mut read_buf).await?; // reuse buffer for later operation
+                    let db_name_buf = read_buf.split_to(db_name_len).freeze();
+                    let db_name =
+                        validate_db_name(&db_name_buf, &mut socket, &mut read_buf).await?;
+
+                    let db_handler = match db_manager.get_db_handle(db_name) {
+                        Ok(handle) => handle,
+                        Err(error_rsp) => {
+                            error_rsp.send_response(&mut socket, &mut read_buf).await?;
+                            return Err(anyhow::anyhow!("Database {} not found", db_name));
+                        }
+                    };
+
+                    db_handler
+                        .send(DatabaseQueryOperation::Info { tx: db_result })
+                        .await?;
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
+                }
+
+                Operation::Drop => {
+                    let db_name_len = socket.read_u8().await? as usize;
+
+                    read_exact_reuse_buf(&mut socket, db_name_len, &mut read_buf).await?; // reuse buffer for later operation
+                    let db_name_buf = read_buf.split_to(db_name_len).freeze();
+                    let db_name =
+                        validate_db_name(&db_name_buf, &mut socket, &mut read_buf).await?;
+
+                    let rsp = db_manager.drop_db(db_name).await?;
+                    rsp.send_response(&mut socket, &mut read_buf).await?;
+                }
+
+                Operation::Get => {
+                    let db_name_len = socket.read_u8().await? as usize;
+                    let key_size = socket.read_u32_le().await? as usize;
+
+                    // perform all validation required
+                    read_exact_reuse_buf(&mut socket, db_name_len, &mut read_buf).await?; // reuse buffer for later operation
+                    let db_name_buf = read_buf.split_to(db_name_len).freeze();
+                    let db_name =
+                        validate_db_name(&db_name_buf, &mut socket, &mut read_buf).await?;
+
+                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
+                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
+                    let key = read_buf.split_to(key_size).freeze();
+
+                    // send to DB manager which router to that DB worker via MPSC queue
+                    // TODO; do sharding here later for better performance
+
+                    let db_handler = match db_manager.get_db_handle(db_name) {
+                        Ok(handle) => handle,
+                        Err(error_rsp) => {
+                            error_rsp.send_response(&mut socket, &mut read_buf).await?;
+                            return Err(anyhow::anyhow!("Database {} not found", db_name));
+                        }
+                    };
+
+                    // send to DB worker
+                    db_handler
+                        .send(DatabaseQueryOperation::GET { key, tx: db_result })
+                        .await?;
+
+                    // wait for db to process result from DB worker and send response back to client
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
+                }
+
+                Operation::Set => {
+                    let db_name_len = socket.read_u8().await? as usize;
+                    let key_size = socket.read_u32_le().await? as usize;
+                    let value_size = socket.read_u32_le().await? as usize;
+
+                    // validate database name
+                    read_exact_reuse_buf(&mut socket, db_name_len, &mut read_buf).await?;
+                    let db_name_buf = read_buf.split_to(db_name_len).freeze();
+                    let db_name =
+                        validate_db_name(&db_name_buf, &mut socket, &mut read_buf).await?;
+
+                    // validate key and value
+                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
+                    validate_value(value_size, max_value_size, &mut socket, &mut read_buf).await?;
+
+                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
+                    let key = read_buf.split_to(key_size).freeze();
+                    read_exact_reuse_buf(&mut socket, value_size, &mut read_buf).await?;
+                    let value = read_buf.split_to(value_size).freeze();
+
+                    // send to DB worker
+                    let db_handler = match db_manager.get_db_handle(db_name) {
+                        Ok(handle) => handle,
+                        Err(error_rsp) => {
+                            error_rsp.send_response(&mut socket, &mut read_buf).await?;
+                            return Err(anyhow::anyhow!("Database {} not found", db_name));
+                        }
+                    };
+
+                    db_handler
+                        .send(DatabaseQueryOperation::SET {
+                            key,
+                            value,
+                            tx: db_result,
+                        })
+                        .await?;
+
+                    // wait for response from DB worker and send back to client
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
+                }
+
+                Operation::Delete => {
+                    let db_name_len = socket.read_u8().await? as usize;
+                    let key_size = socket.read_u32_le().await? as usize;
+
+                    // validate database name
+                    read_exact_reuse_buf(&mut socket, db_name_len, &mut read_buf).await?;
+                    let db_name_buf = read_buf.split_to(db_name_len).freeze();
+                    let db_name =
+                        validate_db_name(&db_name_buf, &mut socket, &mut read_buf).await?;
+
+                    // validate key
+                    validate_key(key_size, max_key_size, &mut socket, &mut read_buf).await?;
+                    read_exact_reuse_buf(&mut socket, key_size, &mut read_buf).await?;
+                    let key = read_buf.split_to(key_size).freeze();
+
+                    // send to DB worker(s)
+                    let db_handler = match db_manager.get_db_handle(db_name) {
+                        Ok(handle) => handle,
+                        Err(error_rsp) => {
+                            error_rsp.send_response(&mut socket, &mut read_buf).await?;
+                            return Err(anyhow::anyhow!("Database {} not found", db_name));
+                        }
+                    };
+
+                    db_handler
+                        .send(DatabaseQueryOperation::DELETE { key, tx: db_result })
+                        .await?;
+
+                    // wait for response from DB worker and send back to client
+                    send_db_result_to_client(client_response, &mut socket, &mut read_buf).await?;
                 }
             },
             None => {
@@ -327,6 +461,49 @@ async fn read_exact_reuse_buf(
         Err(e) => {
             buf.clear();
             Err(e.into())
+        }
+    }
+}
+
+#[inline(always)]
+async fn validate_db_name<'a>(
+    name_buf: &'a [u8],
+    socket: &mut TcpStream,
+    buf: &mut BytesMut,
+) -> Result<&'a str> {
+    if name_buf.is_empty() {
+        let rsp = Response::InvalidRequest(Bytes::from_static(b"Database name cannot be empty"));
+        rsp.send_response(socket, buf).await?;
+        return Err(anyhow::anyhow!("Database name cannot be empty"));
+    }
+    if name_buf.len() > MAX_DB_NAME_LEN {
+        let rsp = Response::PayloadTooLarge(Bytes::from_static(b"Database name too long"));
+        rsp.send_response(socket, buf).await?;
+        return Err(anyhow::anyhow!(format!(
+            "Database name {} exceeds maximum allowed length of {} bytes",
+            String::from_utf8_lossy(name_buf),
+            MAX_DB_NAME_LEN
+        )));
+    }
+
+    // check for file_name safety (path-injection prevention)
+    if !name_buf
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+    {
+        let rsp =
+            Response::InvalidRequest(Bytes::from_static(b"Invalid characters in database name"));
+        rsp.send_response(socket, buf).await?;
+        return Err(anyhow::anyhow!("Invalid characters in database name"));
+    }
+
+    match core::str::from_utf8(name_buf) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let rsp =
+                Response::InvalidRequest(Bytes::from_static(b"Database name must be valid UTF-8"));
+            rsp.send_response(socket, buf).await?;
+            Err(anyhow::anyhow!("Database name must be valid UTF-8"))
         }
     }
 }

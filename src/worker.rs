@@ -66,8 +66,13 @@ impl DatabaseWorker {
                     // - key by (min, mean and max byte size)
                     // - key_count
 
-                    let size_on_disk = self.wal.size_on_disk() as u32;
-                    let size_in_memory = size_of_val(&self.memory_index) as u32;
+                    let size_on_disk = self.wal.size_on_disk().min(u32::MAX as u64) as u32;
+                    let size_in_memory: u32 = self
+                        .memory_index
+                        .iter()
+                        .map(|(k, v)| (k.len() + v.len()) as u64)
+                        .sum::<u64>()
+                        .min(u32::MAX as u64) as u32;
 
                     // iter n calculate the sizes of the keys
                     let (min_key_size, max_key_size, total_key_size) = self

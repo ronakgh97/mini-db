@@ -1,3 +1,4 @@
+use anyhow::Result;
 use bytes::Bytes;
 use mini_db::wal::{CRC_LEN, HEADER_LEN, Wal};
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ fn record_len(klen: usize, vlen: usize) -> u64 {
 }
 
 #[tokio::test]
-async fn empty_init_returns_empty_map() -> anyhow::Result<()> {
+async fn empty_init_returns_empty_map() -> Result<()> {
     let path = tmp_path("empty");
     cleanup(&path).await;
 
@@ -41,7 +42,7 @@ async fn empty_init_returns_empty_map() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn set_entries_survive_recovery() -> anyhow::Result<()> {
+async fn set_entries_survive_recovery() -> Result<()> {
     let path = tmp_path("set-recover");
     cleanup(&path).await;
 
@@ -70,7 +71,7 @@ async fn set_entries_survive_recovery() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn delete_removes_key_on_recovery() -> anyhow::Result<()> {
+async fn delete_removes_key_on_recovery() -> Result<()> {
     let path = tmp_path("delete");
     cleanup(&path).await;
 
@@ -96,7 +97,7 @@ async fn delete_removes_key_on_recovery() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn append_rejects_structurally_invalid() -> anyhow::Result<()> {
+async fn append_rejects_structurally_invalid() -> Result<()> {
     let path = tmp_path("reject");
     cleanup(&path).await;
 
@@ -135,7 +136,7 @@ async fn append_rejects_structurally_invalid() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn torn_tail_is_truncated_on_init() -> anyhow::Result<()> {
+async fn torn_tail_is_truncated_on_init() -> Result<()> {
     let path = tmp_path("torn");
     cleanup(&path).await;
 
@@ -173,7 +174,7 @@ async fn torn_tail_is_truncated_on_init() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn crc_mismatch_discards_tail_suffix() -> anyhow::Result<()> {
+async fn crc_mismatch_discards_tail_suffix() -> Result<()> {
     let path = tmp_path("crc");
     cleanup(&path).await;
 
@@ -204,7 +205,7 @@ async fn crc_mismatch_discards_tail_suffix() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn unknown_op_tail_is_truncated_not_panicking() -> anyhow::Result<()> {
+async fn unknown_op_tail_is_truncated_not_panicking() -> Result<()> {
     let path = tmp_path("unknown-op");
     cleanup(&path).await;
 
@@ -240,7 +241,7 @@ async fn unknown_op_tail_is_truncated_not_panicking() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn offsets_are_monotonic_record_starts() -> anyhow::Result<()> {
+async fn offsets_are_monotonic_record_starts() -> Result<()> {
     let path = tmp_path("offsets");
     cleanup(&path).await;
 
@@ -266,7 +267,7 @@ async fn offsets_are_monotonic_record_starts() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn crc_correct_bogus_op_tail_is_truncated_not_panicking() -> anyhow::Result<()> {
+async fn crc_correct_bogus_op_tail_is_truncated_not_panicking() -> Result<()> {
     let path = tmp_path("bogus-op-crc");
     cleanup(&path).await;
 
@@ -313,6 +314,33 @@ async fn crc_correct_bogus_op_tail_is_truncated_not_panicking() -> anyhow::Resul
     assert_eq!(map.get(&Bytes::from("k1")).unwrap(), &Bytes::from("v1"));
     assert_eq!(wal2.next_offset(), good_len);
     assert_eq!(tokio::fs::metadata(&path).await?.len(), good_len);
+
+    cleanup(&path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn wal_perf_test() -> Result<()> {
+    let path = tmp_path("perf");
+    cleanup(&path).await;
+
+    let n = 100_000;
+    let (mut wal, _) = Wal::init(path.clone()).await?;
+    let key = Bytes::from_static(b"perf-key");
+    let value = Bytes::from_static(b"perf-value");
+
+    let start = std::time::Instant::now();
+    for _ in 0..n {
+        wal.append(OP_SET, &key, &value).await?;
+    }
+    wal.fsync().await?;
+    let elapsed = start.elapsed();
+    println!(
+        "WAL append {} entries took {:?} ({:.2} ops/sec)",
+        n,
+        elapsed,
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     cleanup(&path).await;
     Ok(())

@@ -13,16 +13,20 @@
 ```rust
 #[repr(C)]
 pub enum Operation {
+    Stats,
+    Ping,
+    Close,
+    Create,
+    Info,
+    Drop,
     Get,
     Set,
     Delete,
-    Ping,
-    Close,
 }
 ```
 
-GET/SET/DELETE/PING/CLOSE = 0x00/0x01/0x02/0x03/0x04 -
-`(1B op|4B key_length|4B value_length|key|value|)` (All are Little Endian)
+STATS/PING/CLOSE/CREATE/INFO/DROP/GET/SET/DELETE = 0x00/0x01/0x02/0x03/0x04/0x05/0x06/0x07/0x08 -
+`(1B op|1B db_name_len|4B key_length|4B value_length|db_name|key|value|)` (Little Endian)
 
 - Response
 
@@ -31,6 +35,8 @@ GET/SET/DELETE/PING/CLOSE = 0x00/0x01/0x02/0x03/0x04 -
 pub enum Response {
     Ok(Bytes),
     Pong(Bytes),
+    DbNotFound(Bytes),
+    DbAlreadyExists(Bytes),
     KeyValue(Bytes),
     KeyNotFound(Bytes),
     InvalidRequest(Bytes),
@@ -39,8 +45,9 @@ pub enum Response {
 }
 ```
 
-OK/Pong/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError = 0x00/0x01/0x02/0x03/0x04/0x05/0x06 -
-`(1B status|4B value_length|value|)` (All are Little Endian)
+OK/Pong/DbNotFound/DbAlreadyExists/KeyValue/KeyNotFound/InvalidRequest/PayloadTooLarge/InternalError =
+0x00/0x01/0x02/0x03/0x04/0x05/0x06/0x07/0x08 -
+`(1B status|4B value_length|value|)` (Little Endian)
 
 **Benchmarks**
 
@@ -49,6 +56,7 @@ mini-bench --workload read-overwrite
 
 Mini-db e2e benchmark
   server:    127.0.0.1:8787
+  db:        default
   workload:  ReadOverwrite
   clients:   32
   ops:       256000
@@ -57,25 +65,25 @@ Mini-db e2e benchmark
   mix:       80% GET / 20% SET
   warmup:    1024
 
-Prefilling 16384 keys... done in 2.49s
-Warming up with 1024 operations... done in 26.90ms
+Prefilling 16384 keys... done in 1.94s
+Warming up with 1024 operations... done in 14.02ms
 Running 256000 sampled operations
 
 Results
   completed:  256000
-  elapsed:    5.968 s
-  throughput: 42896 ops/s
-  min:        22.000 us
-  mean:       744.475 us
-  p50:        707.900 us
-  p90:        1.215 ms
-  p95:        1.277 ms
-  p99:        1.422 ms
-  p99.9:      1.808 ms
-  max:        11.157 ms
+  elapsed:    3.677 s
+  throughput: 69620 ops/s
+  min:        18.400 us
+  mean:       458.567 us
+  p50:        278.600 us
+  p90:        875.400 us
+  p95:        929.900 us
+  p99:        1.083 ms
+  p99.9:      1.352 ms
+  max:        2.178 ms
 ```
 
-**TODO**    
+**TODO**
 
 - Multiple DB workers (Sharding and Synchronization)
 - Faster to memory index for read operations (Rwlock)
